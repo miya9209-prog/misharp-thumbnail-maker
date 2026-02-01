@@ -85,10 +85,9 @@ def split_detail_image_by_white_rows(
 def should_split(pil_img: Image.Image) -> bool:
     """
     '상세페이지 긴 이미지'만 분할 적용.
-    (일반 개별 상품컷은 분할하지 않음)
     """
     w, h = pil_img.size
-    return h >= int(w * 2.0)  # 세로가 충분히 길 때만
+    return h >= int(w * 2.0)
 
 
 # =========================
@@ -162,11 +161,6 @@ def trim_edge_whitespace(
 # 3) Foreground center (subject center)
 # =========================
 def foreground_center(pil_img: Image.Image, diff_thr: int = 22):
-    """
-    코너 배경색과 차이로 전경 마스크를 만들고
-    전경 중심(cx, cy)을 반환.
-    실패하면 이미지 중앙.
-    """
     img = pil_img.convert("RGB")
     arr = np.array(img).astype(np.int16)
     h, w = arr.shape[:2]
@@ -184,41 +178,27 @@ def foreground_center(pil_img: Image.Image, diff_thr: int = 22):
         return (w / 2.0, h / 2.0)
 
     ys, xs = np.where(mask)
-    cx = xs.mean()
-    cy = ys.mean()
-    return (cx, cy)
+    return (xs.mean(), ys.mean())
 
 
 # =========================
-# 4) FILL CROP (no padding, no blur)
-#    - ALWAYS crops to target aspect
-#    - center around subject center
+# 4) Fill-crop to target aspect (no padding, no blur)
 # =========================
 def fill_crop_to_aspect(pil_img: Image.Image, target_ar: float, cx: float, cy: float):
-    """
-    여백 없이 꽉 차게 만드는 'Fill Crop':
-    - 원본 AR이 target보다 넓으면: 좌우를 자르고 높이는 유지
-    - 원본 AR이 target보다 좁으면: 상하를 자르고 너비는 유지
-    중심은 (cx, cy) 기준으로 잡고, 이미지 밖으로 나가지 않도록 clamp.
-    """
     img = pil_img.convert("RGB")
     W, H = img.size
     ar = W / H
 
     if ar > target_ar:
-        # 너무 넓다 -> 폭을 줄여야 함 (좌우 크롭)
         crop_h = H
         crop_w = int(round(target_ar * crop_h))
     else:
-        # 너무 세로다/좁다 -> 높이를 줄여야 함 (상하 크롭)
         crop_w = W
         crop_h = int(round(crop_w / target_ar))
 
-    # crop box left/top centered at (cx, cy)
     left = int(round(cx - crop_w / 2))
     top = int(round(cy - crop_h / 2))
 
-    # clamp
     left = max(0, min(left, W - crop_w))
     top = max(0, min(top, H - crop_h))
 
@@ -226,49 +206,59 @@ def fill_crop_to_aspect(pil_img: Image.Image, target_ar: float, cx: float, cy: f
 
 
 def make_thumb_450x633(pil_img: Image.Image):
-    """
-    형준님 요구 최종:
-    - 흰 여백 제거(트림)
-    - 피사체 중심 계산
-    - 여백 없이 450:633 비율로 '꽉 차게 크롭'(잘려도 OK)
-    - 450x633 리사이즈(왜곡 없음)
-    """
     cut = trim_edge_whitespace(pil_img)
-
     cx, cy = foreground_center(cut, diff_thr=22)
     cropped = fill_crop_to_aspect(cut, TARGET_AR, cx, cy)
-
-    out = cropped.resize((TARGET_W, TARGET_H), Image.LANCZOS)
-    return out
+    return cropped.resize((TARGET_W, TARGET_H), Image.LANCZOS)
 
 
 # =========================
-# Page image extraction
+# 5) URL: extract ONLY from detail content area
 # =========================
-def extract_image_urls_from_page(page_url: str, max_images: int = 250) -> list[str]:
+DETAIL_CONTAINER_SELECTORS = [
+    "#prdDetailContent",
+    "#prdDetail",
+    ".xans-product-detail",
+    ".xans-product-detaildesign",
+    ".xans-product-additional",
+    "#productDetail",  # 테마별 대비
+]
+
+
+def extract_detail_image_urls_only(page_url: str, max_images: int = 250) -> list[str]:
+    """
+    ✅ 상세페이지 URL 입력 시:
+    '본문 상세영역 컨테이너' 안에 있는 img만 수집
+    """
     html = requests.get(page_url, headers=HEADERS, timeout=25).text
     soup = BeautifulSoup(html, "lxml")
 
-    selectors = [
-        "#prdDetail img",
-        "#prdDetailContent img",
-        ".xans-product-detail img",
-        ".xans-product-detaildesign img",
-        ".xans-product-additional img",
-        "img",
-    ]
+    container = None
+    for sel in DETAIL_CONTAINER_SELECTORS:
+        container = soup.select_one(sel)
+        if container:
+            break
+
+    # 본문 컨테이너를 못 찾으면(테마 이슈) -> 안전하게 전체에서 찾되, 마지막 fallback
+    scope = container if container else soup
 
     urls = []
-    for sel in selectors:
-        for img in soup.select(sel):
-            src = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
-            if not src:
-                continue
-            full = urljoin(page_url, src)
-            if full not in urls:
-                urls.append(full)
-            if len(urls) >= max_images:
-                return urls
+    for img in scope.select("img"):
+        src = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
+        if not src:
+            continue
+        full = urljoin(page_url, src)
+
+        # data URI 같은 거 제외
+        if full.startswith("data:"):
+            continue
+
+        if full not in urls:
+            urls.append(full)
+
+        if len(urls) >= max_images:
+            break
+
     return urls
 
 
@@ -276,10 +266,6 @@ def extract_image_urls_from_page(page_url: str, max_images: int = 250) -> list[s
 # Processing
 # =========================
 def process_image_any(pil_img: Image.Image, prefix: str):
-    """
-    - 긴 상세페이지면: 분할 후 각 조각을 썸네일
-    - 일반 이미지면: 그대로 1장 썸네일
-    """
     outputs = []
 
     if should_split(pil_img):
@@ -301,32 +287,31 @@ def process_image_any(pil_img: Image.Image, prefix: str):
 # Streamlit UI
 # =========================
 st.set_page_config(layout="wide")
-st.title("상세페이지 썸네일 생성기 — 여백 없이 450×633 '중앙 크롭' (잘려도 OK)")
-st.caption("블러/패딩 없음. 각 컷을 무조건 450×633으로 꽉 차게 크롭합니다. (좌우/상하 일부 잘림 허용)")
+st.title("상세페이지 썸네일 생성기 — URL은 '본문 상세이미지'만 추출")
+st.caption("URL 입력 시 본문(상세영역) 이미지에서만 추출 → 450×633 여백 없이 중앙 크롭")
 
 with st.expander("고급 옵션", expanded=False):
-    max_images = st.slider("상세페이지에서 수집할 최대 이미지 수", 50, 600, 250, step=50)
-    st.write("※ 피사체 중앙은 자동 추정(전경 마스크)이며, 실패 시 중앙 크롭됩니다.")
-    st.write("※ 결과는 무조건 450×633, 여백 0 입니다.")
+    max_images = st.slider("상세영역에서 수집할 최대 이미지 수", 50, 600, 250, step=50)
+    st.write("※ URL 입력: 본문 상세영역(#prdDetail 등) 내부 img만 수집합니다.")
 
 tab1, tab2, tab3 = st.tabs(["① 상세페이지 URL", "② 이미지 주소(URL)", "③ 이미지 업로드"])
 
 all_outputs = []
 
-# ① 상세페이지 URL
+# ① 상세페이지 URL (본문 전용)
 with tab1:
     page_url = st.text_input("상세페이지 URL", placeholder="https://.../product/detail.html?product_no=28461")
-    if st.button("URL에서 이미지 수집 → 생성", type="primary", key="go1"):
+    if st.button("URL에서 '본문 상세이미지'만 수집 → 생성", type="primary", key="go1"):
         if not page_url.strip():
             st.error("상세페이지 URL을 입력해주세요.")
         else:
-            with st.spinner("이미지 URL 수집 중…"):
-                urls = extract_image_urls_from_page(page_url.strip(), max_images=max_images)
+            with st.spinner("본문 상세영역 이미지 URL 수집 중…"):
+                urls = extract_detail_image_urls_only(page_url.strip(), max_images=max_images)
 
             if not urls:
-                st.error("이미지 URL을 찾지 못했습니다.")
+                st.error("본문(상세영역)에서 이미지 URL을 찾지 못했습니다. 테마 구조가 다를 수 있어요.")
             else:
-                with st.spinner(f"다운로드 및 처리 중… ({len(urls)}개 후보)"):
+                with st.spinner(f"다운로드 및 처리 중… ({len(urls)}개)"):
                     for i, u in enumerate(urls, start=1):
                         try:
                             pil = download_image(u)
@@ -370,7 +355,6 @@ with tab3:
 
 # 결과 출력
 if all_outputs:
-    # 최종 사이즈 강제 보장
     fixed = []
     for name, img in all_outputs:
         img = img.resize((TARGET_W, TARGET_H), Image.LANCZOS)
