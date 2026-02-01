@@ -1,18 +1,19 @@
 import io
 import re
 import zipfile
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import numpy as np
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from PIL import Image, ImageFilter
+from PIL import Image
 
 # =========================
-# Fixed output size
+# Output size (fixed)
 # =========================
 TARGET_W, TARGET_H = 450, 633
+TARGET_AR = TARGET_W / TARGET_H
 
 HEADERS = {
     "User-Agent": (
@@ -22,40 +23,32 @@ HEADERS = {
 }
 
 # =========================
-# Helpers
+# Utils
 # =========================
 def safe_name(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"[^\w\-.가-힣]+", "_", s)
     return s[:120] if s else "item"
 
-def is_image_url(u: str) -> bool:
-    u = (u or "").lower()
-    return u.endswith((".jpg", ".jpeg", ".png", ".webp"))
-
-def download_bytes(url: str) -> bytes:
-    r = requests.get(url, headers={**HEADERS, "Referer": url}, timeout=30)
-    r.raise_for_status()
-    return r.content
 
 def download_image(url: str) -> Image.Image:
-    content = download_bytes(url)
-    return Image.open(io.BytesIO(content)).convert("RGB")
+    r = requests.get(url, headers={**HEADERS, "Referer": url}, timeout=30)
+    r.raise_for_status()
+    return Image.open(io.BytesIO(r.content)).convert("RGB")
+
 
 # =========================
-# 1) Split long detail image into pieces
-#    by detecting "horizontal white gaps"
+# 1) Split long detail image into pieces by "horizontal white gaps"
 # =========================
 def split_detail_image_by_white_rows(
     pil_img: Image.Image,
     white_thr: int = 245,
-    white_ratio: float = 0.98,
-    min_gap: int = 60,
+    white_ratio: float = 0.985,
+    min_gap: int = 70,
     min_cut_height: int = 220,
 ):
     """
-    긴 상세페이지 이미지(a.jpg) 안에서
-    '완전히 흰 가로 여백 구간'을 찾아 컷을 분할합니다.
+    긴 상세페이지 이미지에서 '가로 흰 띠(여백)'를 찾아 컷 분리.
     """
     gray = pil_img.convert("L")
     arr = np.array(gray)
@@ -93,19 +86,18 @@ def split_detail_image_by_white_rows(
 
     return cuts
 
+
 # =========================
-# 2) Strong whitespace trim (top/bottom/left/right)
+# 2) Strong whitespace trim (true cropping)
 # =========================
-def trim_all_whitespace(
+def trim_edge_whitespace(
     pil_img: Image.Image,
     white_thr: int = 245,
     white_ratio: float = 0.985,
-    min_run: int = 8,
-) -> Image.Image:
+    min_run: int = 6,
+):
     """
-    상/하/좌/우 가장자리에서
-    '거의 흰색'인 행/열을 반복적으로 제거합니다.
-    (완전 흰 여백 제거 목적)
+    이미지 가장자리에서 '거의 흰색'인 행/열을 반복적으로 잘라냄.
     """
     img = pil_img.convert("RGB")
     arr = np.array(img)
@@ -155,7 +147,7 @@ def trim_all_whitespace(
             changed = True
 
         # 너무 과한 트림 방지
-        if (bottom - top) < 60 or (right - left) < 60:
+        if (bottom - top) < 80 or (right - left) < 80:
             return img
 
         arr = arr[top : bottom + 1, left : right + 1, :]
@@ -164,60 +156,130 @@ def trim_all_whitespace(
 
     return Image.fromarray(arr)
 
+
 # =========================
-# 3) Make final 450x633:
-#    - No white border
-#    - No subject crop (contain)
-#    - Always exact size
-#    - Fill leftover with blurred background (not white)
+# 3) Foreground bbox (subject) detection by background color difference
 # =========================
-def make_thumb_450x633_no_white_no_crop(pil_img: Image.Image) -> Image.Image:
+def foreground_bbox(
+    pil_img: Image.Image,
+    diff_thr: int = 22,
+    margin: int = 6,
+):
     """
-    1) 흰 여백 강제 제거
-    2) 450x633으로 무조건 고정
-       - 상품은 절대 안 잘리게 contain
-       - 남는 영역은 흰색 금지 → 원본을 cover로 깔고 블러 처리
+    코너 배경색(대개 흰/연회색)과의 색 차이로 전경 마스크를 만든 뒤 bbox 계산.
     """
-    cut = trim_all_whitespace(pil_img)
+    img = pil_img.convert("RGB")
+    arr = np.array(img).astype(np.int16)
+    h, w = arr.shape[:2]
 
-    target_w, target_h = TARGET_W, TARGET_H
-    w, h = cut.size
+    corners = np.array(
+        [arr[0, 0], arr[0, w - 1], arr[h - 1, 0], arr[h - 1, w - 1]],
+        dtype=np.int16,
+    )
+    bg = np.median(corners, axis=0)
 
-    # (A) Background: cover + crop + blur
-    scale_cover = max(target_w / w, target_h / h)
-    bg = cut.resize((int(w * scale_cover), int(h * scale_cover)), Image.LANCZOS)
-    bw, bh = bg.size
-    left = (bw - target_w) // 2
-    top = (bh - target_h) // 2
-    bg = bg.crop((left, top, left + target_w, top + target_h))
-    bg = bg.filter(ImageFilter.GaussianBlur(radius=18))
+    diff = np.sqrt(((arr - bg) ** 2).sum(axis=2))
+    mask = diff > diff_thr
 
-    # (B) Foreground: contain (no crop)
-    scale_contain = min(target_w / w, target_h / h)
-    fg = cut.resize((int(w * scale_contain), int(h * scale_contain)), Image.LANCZOS)
+    if not mask.any():
+        # 전경 검출 실패면 전체를 전경으로
+        return (0, 0, w - 1, h - 1)
 
-    # (C) Composite
-    canvas = bg.copy()
-    fw, fh = fg.size
-    px = (target_w - fw) // 2
-    py = (target_h - fh) // 2
-    canvas.paste(fg, (px, py))
+    ys, xs = np.where(mask)
+    x1, x2 = xs.min(), xs.max()
+    y1, y2 = ys.min(), ys.max()
 
-    # Final guarantee
-    if canvas.size != (target_w, target_h):
-        canvas = canvas.resize((target_w, target_h), Image.LANCZOS)
+    x1 = max(0, x1 - margin)
+    y1 = max(0, y1 - margin)
+    x2 = min(w - 1, x2 + margin)
+    y2 = min(h - 1, y2 + margin)
 
-    return canvas
+    return (x1, y1, x2, y2)
+
 
 # =========================
-# Page image extraction (generic)
+# 4) Crop to target aspect around subject (NO distortion, NO blur, NO padding)
 # =========================
-def extract_image_urls_from_page(page_url: str, max_images: int = 400) -> list[str]:
+def crop_to_aspect_keep_subject(
+    pil_img: Image.Image,
+    target_ar: float,
+    bbox,
+    extra_margin_ratio: float = 0.06,
+):
+    """
+    - target_ar(450/633)에 맞게 크롭
+    - 중심은 피사체 bbox 중심
+    - 가능하면 bbox 전체가 들어가도록 크롭 크기 결정
+    - 결과는 "패딩 없이" 크롭만 수행 (흰 여백 없음)
+    """
+    img = pil_img.convert("RGB")
+    W, H = img.size
+    x1, y1, x2, y2 = bbox
+    bw = max(1, x2 - x1 + 1)
+    bh = max(1, y2 - y1 + 1)
+
+    # bbox에 약간 여유
+    mx = int(bw * extra_margin_ratio)
+    my = int(bh * extra_margin_ratio)
+    bx1 = max(0, x1 - mx)
+    by1 = max(0, y1 - my)
+    bx2 = min(W - 1, x2 + mx)
+    by2 = min(H - 1, y2 + my)
+
+    bw = bx2 - bx1 + 1
+    bh = by2 - by1 + 1
+
+    # bbox를 포함하는 최소 crop 크기(비율 고정)
+    # crop_w/crop_h = target_ar
+    crop_w = max(bw, int(target_ar * bh))
+    crop_h = int(round(crop_w / target_ar))
+    if crop_h < bh:
+        crop_h = bh
+        crop_w = int(round(target_ar * crop_h))
+
+    # 이미지보다 커지면 가능한 최대치로 줄이기 (그래도 bbox 못 담으면 현실적으로 불가)
+    if crop_w > W:
+        crop_w = W
+        crop_h = int(round(crop_w / target_ar))
+    if crop_h > H:
+        crop_h = H
+        crop_w = int(round(target_ar * crop_h))
+
+    # 중심은 bbox 중심
+    cx = (bx1 + bx2) / 2.0
+    cy = (by1 + by2) / 2.0
+
+    left = int(round(cx - crop_w / 2))
+    top = int(round(cy - crop_h / 2))
+
+    # 범위 보정
+    left = max(0, min(left, W - crop_w))
+    top = max(0, min(top, H - crop_h))
+
+    return img.crop((left, top, left + crop_w, top + crop_h))
+
+
+def make_thumb_450x633(pil_img: Image.Image):
+    """
+    최종 파이프라인:
+    1) 가장자리 흰 여백 강제 트림
+    2) 전경 bbox 탐지
+    3) 피사체 중심으로 450:633 비율 크롭(패딩/블러/왜곡 없음)
+    4) 450x633 리사이즈
+    """
+    cut = trim_edge_whitespace(pil_img)
+    bbox = foreground_bbox(cut)
+    cropped = crop_to_aspect_keep_subject(cut, TARGET_AR, bbox)
+    return cropped.resize((TARGET_W, TARGET_H), Image.LANCZOS)
+
+
+# =========================
+# Page image extraction
+# =========================
+def extract_image_urls_from_page(page_url: str, max_images: int = 250) -> list[str]:
     html = requests.get(page_url, headers=HEADERS, timeout=25).text
     soup = BeautifulSoup(html, "lxml")
 
-    urls = []
-    # 먼저 상세영역 후보(카페24 포함) + 일반 img
     selectors = [
         "#prdDetail img",
         "#prdDetailContent img",
@@ -227,127 +289,90 @@ def extract_image_urls_from_page(page_url: str, max_images: int = 400) -> list[s
         "img",
     ]
 
+    urls = []
     for sel in selectors:
         for img in soup.select(sel):
             src = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
-            srcset = (img.get("srcset") or img.get("data-srcset") or "").strip()
-
-            best = None
-            if srcset:
-                # pick biggest width in srcset
-                parts = [p.strip() for p in srcset.split(",") if p.strip()]
-                best_w = -1
-                for p in parts:
-                    seg = p.split()
-                    u = seg[0]
-                    wv = 0
-                    if len(seg) > 1 and seg[1].endswith("w"):
-                        try:
-                            wv = int(seg[1][:-1])
-                        except:
-                            wv = 0
-                    if wv > best_w:
-                        best_w = wv
-                        best = u
-
-            u = best or src
-            if not u:
+            if not src:
                 continue
-            full = urljoin(page_url, u)
-
-            # 이미지 확장자 없는 경우도 있어서 완화
+            full = urljoin(page_url, src)
             if full not in urls:
                 urls.append(full)
-
             if len(urls) >= max_images:
                 return urls
 
     return urls
 
-# =========================
-# Core processing for one long image
-# =========================
-def process_long_image(pil_img: Image.Image, prefix: str) -> list[tuple[str, Image.Image]]:
-    outputs = []
 
-    # 1) split into pieces
+# =========================
+# Processing for one long detail image
+# =========================
+def process_long_image(pil_img: Image.Image, prefix: str):
+    outputs = []
     segments = split_detail_image_by_white_rows(pil_img)
 
-    # fallback: if not split well, treat whole image as one piece
+    # 분할이 실패하면 전체를 1컷으로 처리
     if not segments:
         segments = [(0, pil_img.height)]
 
     for idx, (y1, y2) in enumerate(segments, start=1):
         piece = pil_img.crop((0, y1, pil_img.width, y2))
-        thumb = make_thumb_450x633_no_white_no_crop(piece)
-
-        # final hard guarantee
-        thumb = thumb.resize((TARGET_W, TARGET_H), Image.LANCZOS)
-
-        outputs.append((f"{prefix}_{idx:02d}_450x633.jpg", thumb))
+        thumb = make_thumb_450x633(piece)  # <-- 여기서 “여백 없이 + 왜곡 없이 + 450x633” 완성
+        outputs.append((f"{prefix}_{idx:02d}_{TARGET_W}x{TARGET_H}.jpg", thumb))
 
     return outputs
+
 
 # =========================
 # Streamlit UI
 # =========================
 st.set_page_config(layout="wide")
-st.title("상세페이지 썸네일 생성기 (URL / 이미지주소 / 업로드) - 450×633 고정")
-st.caption("긴 상세페이지 이미지(a.jpg)를 상품컷 단위로 분해 → 흰 여백 제거 → 450×633 고정 ZIP 다운로드")
+st.title("상세페이지 썸네일 생성기 (정확 크롭 버전) — 450×633")
+st.caption("블러/배경합성 없이, 피사체 중심으로 '여백 없이' 450×633 크롭합니다. (왜곡 없음)")
 
 with st.expander("고급 옵션 (기본값 권장)", expanded=False):
-    max_images = st.slider("상세페이지에서 수집할 최대 이미지 수", 50, 800, 400, step=50)
-    st.write("※ 이 버전은 '피사체 잘림 금지'를 최우선으로 하며, 흰색 여백은 블러 배경으로 제거합니다.")
-    st.write("※ 최종 결과물은 무조건 450×633입니다.")
+    max_images = st.slider("상세페이지에서 수집할 최대 이미지 수", 50, 600, 250, step=50)
+    st.write("※ 이 버전은 '블러 배경'을 사용하지 않습니다.")
+    st.write("※ 결과는 항상 450×633이며, 흰 여백은 크롭으로 제거합니다.")
 
 tab1, tab2, tab3 = st.tabs(["① 상세페이지 URL", "② 이미지 주소(URL)", "③ 이미지 업로드"])
 
-all_outputs: list[tuple[str, Image.Image]] = []
+all_outputs = []
 
-# -------- Tab 1: Page URL --------
+# ① 상세페이지 URL
 with tab1:
     page_url = st.text_input("상세페이지 URL", placeholder="https://.../product/detail.html?product_no=28461")
-    go1 = st.button("URL에서 이미지 수집 → 썸네일 생성", type="primary", key="go1")
-
-    if go1:
+    if st.button("URL에서 이미지 수집 → 생성", type="primary", key="go1"):
         if not page_url.strip():
             st.error("상세페이지 URL을 입력해주세요.")
         else:
-            with st.spinner("상세페이지에서 이미지 URL 수집 중…"):
-                try:
-                    urls = extract_image_urls_from_page(page_url.strip(), max_images=max_images)
-                except Exception as e:
-                    st.error(f"이미지 URL 수집 실패: {e}")
-                    st.stop()
+            with st.spinner("이미지 URL 수집 중…"):
+                urls = extract_image_urls_from_page(page_url.strip(), max_images=max_images)
 
             if not urls:
-                st.error("페이지에서 이미지 URL을 찾지 못했습니다.")
-                st.stop()
+                st.error("이미지 URL을 찾지 못했습니다.")
+            else:
+                ok = 0
+                with st.spinner(f"다운로드 및 처리 중… ({len(urls)}개 후보)"):
+                    for i, u in enumerate(urls, start=1):
+                        try:
+                            pil = download_image(u)
+                            # 상세페이지에 있는 긴 이미지든, 단일 컷 이미지든 모두 처리
+                            all_outputs += process_long_image(pil, f"url{i:03d}")
+                            ok += 1
+                        except Exception:
+                            continue
+                if ok == 0:
+                    st.error("처리 가능한 이미지가 없습니다. (접근 제한/차단 가능)")
 
-            ok = 0
-            with st.spinner(f"이미지 다운로드 및 처리 중… (후보 {len(urls)}개)"):
-                for i, u in enumerate(urls, start=1):
-                    try:
-                        pil = download_image(u)
-                        # 긴 상세페이지 형태(a.jpg)라 가정하고 처리
-                        all_outputs += process_long_image(pil, f"url{i:03d}")
-                        ok += 1
-                    except Exception:
-                        continue
-
-            if ok == 0:
-                st.error("다운로드/처리 가능한 이미지가 없습니다. (접근 제한 가능)")
-
-# -------- Tab 2: Image URL list --------
+# ② 이미지 주소
 with tab2:
     st.write("이미지 URL을 여러 줄로 붙여넣으세요. (각 줄 1개)")
     url_text = st.text_area("이미지 주소 목록", height=180, placeholder="https://.../a.jpg\nhttps://.../b.jpg\n...")
-    go2 = st.button("이미지 주소로 썸네일 생성", type="primary", key="go2")
-
-    if go2:
+    if st.button("이미지 주소로 생성", type="primary", key="go2"):
         lines = [l.strip() for l in (url_text or "").splitlines() if l.strip()]
         if not lines:
-            st.error("이미지 주소(URL)를 한 줄에 하나씩 넣어주세요.")
+            st.error("이미지 URL을 넣어주세요.")
         else:
             with st.spinner(f"다운로드 및 처리 중… ({len(lines)}개)"):
                 for i, u in enumerate(lines, start=1):
@@ -357,14 +382,13 @@ with tab2:
                     except Exception:
                         continue
 
-# -------- Tab 3: Upload --------
+# ③ 업로드
 with tab3:
     uploads = st.file_uploader(
         "상세페이지 이미지 업로드 (a.jpg 형태, 여러 장 가능)",
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
     )
-
     if uploads:
         with st.spinner(f"업로드 이미지 처리 중… ({len(uploads)}개)"):
             for i, f in enumerate(uploads, start=1):
@@ -375,22 +399,21 @@ with tab3:
                 except Exception:
                     continue
 
-# -------- Results --------
+# 결과 출력
 if all_outputs:
-    # Final hard guarantee on size + filename consistency
-    fixed_outputs = []
+    # 최종 사이즈 강제 보장
+    fixed = []
     for name, img in all_outputs:
         img = img.resize((TARGET_W, TARGET_H), Image.LANCZOS)
-        fixed_outputs.append((name, img))
+        fixed.append((name, img))
 
-    st.success(f"총 {len(fixed_outputs)}장 생성 완료 (모두 {TARGET_W}×{TARGET_H})")
-
+    st.success(f"총 {len(fixed)}장 생성 완료 (모두 {TARGET_W}×{TARGET_H})")
     st.subheader("미리보기 (일부)")
-    st.image([img for _, img in fixed_outputs[:24]], width=180)
+    st.image([img for _, img in fixed[:24]], width=180)
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, img in fixed_outputs:
+        for name, img in fixed:
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=95)
             zf.writestr(name, buf.getvalue())
