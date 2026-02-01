@@ -1,8 +1,6 @@
 streamlit
 pillow
-opencv-python-headless
 requests
 beautifulsoup4
 lxml
 numpy
-ultralytics
