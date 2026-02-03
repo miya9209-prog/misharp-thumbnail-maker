@@ -380,3 +380,27 @@ if all_outputs:
     )
 else:
     st.info("아직 결과가 없습니다. 위 탭에서 입력 후 생성해보세요.")
+
+
+
+
+
+
+
+st.markdown(
+    """
+    <hr style="margin-top:40px; margin-bottom:10px;">
+    <div style="font-size:11px; color:#888; line-height:1.5; text-align:center;">
+        ⓒ misharpcompany. All rights reserved.<br>
+        본 프로그램의 저작권은 미샵컴퍼니(misharpcompany)에 있으며, 무단 복제·배포·사용을 금합니다.<br>
+        본 프로그램은 미샵컴퍼니 내부 직원 전용으로, 외부 유출 및 제3자 제공을 엄격히 금합니다.
+        <br><br>
+        ⓒ misharpcompany. All rights reserved.<br>
+        This program is the intellectual property of misharpcompany.
+        Unauthorized copying, distribution, or use is strictly prohibited.<br>
+        This program is for internal use by misharpcompany employees only
+        and must not be disclosed or shared externally.
+    </div>
+    """,
+    unsafe_allow_html=True
+)
