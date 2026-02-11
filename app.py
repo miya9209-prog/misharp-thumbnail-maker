@@ -22,6 +22,7 @@ HEADERS = {
     )
 }
 
+
 # =========================
 # Utils
 # =========================
@@ -47,6 +48,10 @@ def split_detail_image_by_white_rows(
     min_gap: int = 70,
     min_cut_height: int = 220,
 ):
+    """
+    긴 상세페이지 이미지(세로로 매우 긴 경우)에서
+    가로 '화이트 갭'을 찾아 적당히 분할합니다.
+    """
     gray = pil_img.convert("L")
     arr = np.array(gray)
     h, w = arr.shape
@@ -96,9 +101,14 @@ def should_split(pil_img: Image.Image) -> bool:
 def trim_edge_whitespace(
     pil_img: Image.Image,
     white_thr: int = 245,
-    white_ratio: float = 0.985,
-    min_run: int = 6,
+    white_ratio: float = 0.99,
+    min_run: int = 10,
 ):
+    """
+    이미지 가장자리(상하좌우)에서 '거의 흰색'인 구간을 실제로 잘라냅니다.
+    - white_ratio를 조금 올려(0.99) 얇은 보더도 더 강하게 제거
+    - min_run을 늘려(10) 아주 얇은 라인도 잘 제거되도록
+    """
     img = pil_img.convert("RGB")
     arr = np.array(img)
     h, w = arr.shape[:2]
@@ -114,8 +124,8 @@ def trim_edge_whitespace(
     top, bottom = 0, h - 1
     left, right = 0, w - 1
 
-    changed = True
-    while changed:
+    # 반복 트림
+    while True:
         changed = False
 
         run = 0
@@ -147,69 +157,171 @@ def trim_edge_whitespace(
             changed = True
 
         # 과도한 트림 방지
-        if (bottom - top) < 80 or (right - left) < 80:
+        if (bottom - top) < 120 or (right - left) < 120:
             return img
 
+        if not changed:
+            break
+
         arr = arr[top : bottom + 1, left : right + 1, :]
+        img = Image.fromarray(arr)
+        arr = np.array(img)
         h, w = arr.shape[:2]
         top, bottom, left, right = 0, h - 1, 0, w - 1
 
-    return Image.fromarray(arr)
+    return img
 
 
 # =========================
-# 3) Foreground center (subject center)
+# 3) Foreground detection (bbox + center)
 # =========================
-def foreground_center(pil_img: Image.Image, diff_thr: int = 22):
-    img = pil_img.convert("RGB")
-    arr = np.array(img).astype(np.int16)
-    h, w = arr.shape[:2]
-
+def estimate_background_color(arr_rgb: np.ndarray) -> np.ndarray:
+    """
+    모서리 샘플의 중앙값으로 배경색을 추정합니다.
+    """
+    h, w = arr_rgb.shape[:2]
     corners = np.array(
-        [arr[0, 0], arr[0, w - 1], arr[h - 1, 0], arr[h - 1, w - 1]],
+        [arr_rgb[0, 0], arr_rgb[0, w - 1], arr_rgb[h - 1, 0], arr_rgb[h - 1, w - 1]],
         dtype=np.int16,
     )
-    bg = np.median(corners, axis=0)
+    return np.median(corners, axis=0)
 
+
+def foreground_mask(arr_rgb: np.ndarray, diff_thr: int = 24) -> np.ndarray:
+    """
+    배경 추정 색상과의 색 차이를 이용해 전경 마스크를 만듭니다.
+    diff_thr를 살짝 상향(24)해 '흰 배경'에서 얇은 노이즈를 덜 전경으로 잡게 합니다.
+    """
+    arr = arr_rgb.astype(np.int16)
+    bg = estimate_background_color(arr)
     diff = np.sqrt(((arr - bg) ** 2).sum(axis=2))
-    mask = diff > diff_thr
+    return diff > diff_thr
+
+
+def foreground_bbox_center(pil_img: Image.Image, diff_thr: int = 24):
+    """
+    전경 마스크의 bbox(경계상자)와 중심을 반환합니다.
+    - bbox 기반으로 크롭하면 피사체가 더 중앙에 안정적으로 위치합니다.
+    """
+    img = pil_img.convert("RGB")
+    arr = np.array(img)
+    h, w = arr.shape[:2]
+
+    mask = foreground_mask(arr, diff_thr=diff_thr)
 
     if not mask.any():
-        return (w / 2.0, h / 2.0)
+        # 전경을 못 잡으면 중앙
+        return (0, 0, w - 1, h - 1), (w / 2.0, h / 2.0)
 
     ys, xs = np.where(mask)
-    return (xs.mean(), ys.mean())
+    x1, x2 = xs.min(), xs.max()
+    y1, y2 = ys.min(), ys.max()
+
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    return (x1, y1, x2, y2), (cx, cy)
 
 
 # =========================
-# 4) Fill-crop to target aspect (no padding, no blur)
+# 4) Crop strategy (bbox-fit + aspect fill)
 # =========================
-def fill_crop_to_aspect(pil_img: Image.Image, target_ar: float, cx: float, cy: float):
+def crop_around_bbox_to_aspect(
+    pil_img: Image.Image,
+    target_ar: float,
+    bbox,
+    center,
+    pad_ratio: float = 0.18,
+):
+    """
+    핵심:
+    - 전경 bbox를 기준으로 '적당한 여유(pad_ratio)'를 주고
+    - 그 영역을 target_ar에 맞춰 확장(필요 시)해서 자릅니다.
+    - 절대 패딩(여백 추가) 없이 "자르기"만 합니다.
+    => 흰 여백이 보일 가능성이 크게 줄어듭니다.
+    """
     img = pil_img.convert("RGB")
     W, H = img.size
-    ar = W / H
+    x1, y1, x2, y2 = bbox
+    cx, cy = center
 
-    if ar > target_ar:
-        crop_h = H
-        crop_w = int(round(target_ar * crop_h))
-    else:
-        crop_w = W
+    bw = max(1, (x2 - x1))
+    bh = max(1, (y2 - y1))
+
+    # bbox에 여유를 조금 주기(피사체가 너무 꽉 차서 잘리는 느낌 방지)
+    pad_w = int(round(bw * pad_ratio))
+    pad_h = int(round(bh * pad_ratio))
+
+    rx1 = int(max(0, x1 - pad_w))
+    ry1 = int(max(0, y1 - pad_h))
+    rx2 = int(min(W - 1, x2 + pad_w))
+    ry2 = int(min(H - 1, y2 + pad_h))
+
+    rw = max(1, rx2 - rx1)
+    rh = max(1, ry2 - ry1)
+
+    # 이제 이 '관심영역'을 target_ar에 맞춰 "확장" (줄이지 않음)
+    # 확장할 때도 중심은 전경 중심(cx,cy)을 최대한 유지
+    roi_ar = rw / rh
+    if roi_ar > target_ar:
+        # 너무 가로로 넓음 -> 높이를 늘려야 함
+        crop_w = rw
         crop_h = int(round(crop_w / target_ar))
+    else:
+        # 너무 세로로 김 -> 너비를 늘려야 함
+        crop_h = rh
+        crop_w = int(round(target_ar * crop_h))
 
+    # 전경 중심 기준으로 배치
     left = int(round(cx - crop_w / 2))
     top = int(round(cy - crop_h / 2))
 
+    # 이미지 경계 안으로 클램프
     left = max(0, min(left, W - crop_w))
     top = max(0, min(top, H - crop_h))
 
     return img.crop((left, top, left + crop_w, top + crop_h))
 
 
+def final_safe_trim_after_resize(pil_img: Image.Image):
+    """
+    최종 450x633로 리사이즈 후, 혹시 남아있을 수 있는 1~3px 수준의
+    얇은 흰 테두리를 '미세 트림'으로 제거한 뒤 다시 450x633으로 맞춥니다.
+    (사용자 요구: 흰 여백 절대 보이면 안됨)
+    """
+    # 아주 얇은 테두리만 제거하려고 min_run 작게
+    trimmed = trim_edge_whitespace(
+        pil_img,
+        white_thr=247,
+        white_ratio=0.995,
+        min_run=2,
+    )
+    if trimmed.size != (TARGET_W, TARGET_H):
+        trimmed = trimmed.resize((TARGET_W, TARGET_H), Image.LANCZOS)
+    return trimmed
+
+
 def make_thumb_450x633(pil_img: Image.Image):
+    # 1) 가장자리 흰 여백 제거(1차)
     cut = trim_edge_whitespace(pil_img)
-    cx, cy = foreground_center(cut, diff_thr=22)
-    cropped = fill_crop_to_aspect(cut, TARGET_AR, cx, cy)
-    return cropped.resize((TARGET_W, TARGET_H), Image.LANCZOS)
+
+    # 2) 전경 bbox/center 계산
+    bbox, center = foreground_bbox_center(cut, diff_thr=24)
+
+    # 3) bbox 기반 + target_ar 맞춤 크롭 (피사체 중앙 정렬 강화)
+    cropped = crop_around_bbox_to_aspect(
+        cut,
+        TARGET_AR,
+        bbox=bbox,
+        center=center,
+        pad_ratio=0.18,
+    )
+
+    # 4) 최종 리사이즈 (패딩 없음)
+    out = cropped.resize((TARGET_W, TARGET_H), Image.LANCZOS)
+
+    # 5) 혹시 남을 미세 흰 테두리까지 최종 안전 트림
+    out = final_safe_trim_after_resize(out)
+    return out
 
 
 # =========================
@@ -221,7 +333,7 @@ DETAIL_CONTAINER_SELECTORS = [
     ".xans-product-detail",
     ".xans-product-detaildesign",
     ".xans-product-additional",
-    "#productDetail",  # 테마별 대비
+    "#productDetail",
 ]
 
 
@@ -239,17 +351,23 @@ def extract_detail_image_urls_only(page_url: str, max_images: int = 250) -> list
         if container:
             break
 
-    # 본문 컨테이너를 못 찾으면(테마 이슈) -> 안전하게 전체에서 찾되, 마지막 fallback
+    # 본문 컨테이너를 못 찾으면(테마 이슈) -> 전체에서 찾되, 마지막 fallback
     scope = container if container else soup
 
     urls = []
     for img in scope.select("img"):
-        src = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
+        src = (
+            img.get("src")
+            or img.get("data-src")
+            or img.get("data-original")
+            or ""
+        ).strip()
         if not src:
             continue
+
         full = urljoin(page_url, src)
 
-        # data URI 같은 거 제외
+        # data URI 제외
         if full.startswith("data:"):
             continue
 
@@ -287,12 +405,29 @@ def process_image_any(pil_img: Image.Image, prefix: str):
 # Streamlit UI
 # =========================
 st.set_page_config(layout="wide")
-st.title("상세페이지 썸네일 생성기 — URL은 '본문 상세이미지'만 추출")
-st.caption("URL 입력 시 본문(상세영역) 이미지에서만 추출 → 450×633 여백 없이 중앙 크롭")
+
+# ---- Title (30% smaller) + English subtitle ----
+st.markdown(
+    """
+    <style>
+      .misharp-title-wrap { margin-top: 8px; margin-bottom: 6px; }
+      .misharp-title { font-size: 1.55rem; font-weight: 800; letter-spacing: -0.02em; margin: 0; }
+      .misharp-sub { font-size: 0.78rem; color: #666; margin-top: 6px; }
+      .misharp-caption { color:#666; font-size: 0.92rem; margin-top: 8px; }
+    </style>
+    <div class="misharp-title-wrap">
+      <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
+      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V1</div>
+      <div class="misharp-caption">URL 입력 시 본문(상세영역) 이미지에서만 추출 → 450×633 여백 없이 피사체 중앙 크롭</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.expander("고급 옵션", expanded=False):
     max_images = st.slider("상세영역에서 수집할 최대 이미지 수", 50, 600, 250, step=50)
     st.write("※ URL 입력: 본문 상세영역(#prdDetail 등) 내부 img만 수집합니다.")
+    st.write("※ 크롭 방식: 전경(피사체) bbox 기반 중앙정렬 + 패딩 없이 크롭(흰 여백 방지).")
 
 tab1, tab2, tab3 = st.tabs(["① 상세페이지 URL", "② 이미지 주소(URL)", "③ 이미지 업로드"])
 
@@ -339,7 +474,7 @@ with tab2:
 # ③ 업로드
 with tab3:
     uploads = st.file_uploader(
-        "상세페이지 이미지 업로드 (a.jpg 형태, 여러 장 가능)",
+        "상세페이지 이미지 업로드 (여러 장 가능)",
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
     )
@@ -357,10 +492,12 @@ with tab3:
 if all_outputs:
     fixed = []
     for name, img in all_outputs:
+        # 최종 규격 강제 + 안전 트림
         img = img.resize((TARGET_W, TARGET_H), Image.LANCZOS)
+        img = final_safe_trim_after_resize(img)
         fixed.append((name, img))
 
-    st.success(f"총 {len(fixed)}장 생성 완료 (모두 {TARGET_W}×{TARGET_H}, 여백 0)")
+    st.success(f"총 {len(fixed)}장 생성 완료 (모두 {TARGET_W}×{TARGET_H}, 흰 여백 0 목표)")
     st.subheader("미리보기 (일부)")
     st.image([img for _, img in fixed[:24]], width=180)
 
@@ -380,12 +517,6 @@ if all_outputs:
     )
 else:
     st.info("아직 결과가 없습니다. 위 탭에서 입력 후 생성해보세요.")
-
-
-
-
-
-
 
 st.markdown(
     """
