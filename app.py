@@ -38,8 +38,7 @@ def download_image(url: str) -> Image.Image:
 
 
 # =========================
-# 1) Edge band trim (white/black) - conservative
-#    => removes real border bars without eating photo
+# Edge band trim (white/black) - conservative
 # =========================
 def trim_edge_bands(
     pil_img: Image.Image,
@@ -49,10 +48,6 @@ def trim_edge_bands(
     white_thr: int = 246,
     black_thr: int = 9,
 ):
-    """
-    가장자리의 "거의 흰 띠" / "거의 검정 띠"를 실제로 잘라냅니다.
-    - 아주 보수적으로 동작하도록 설정(사진 영역 오검출 최소화)
-    """
     img = pil_img.convert("RGB")
     arr = np.array(img).astype(np.int16)
     h, w = arr.shape[:2]
@@ -122,7 +117,76 @@ def trim_edge_bands(
 
 
 # =========================
-# 2) Split long detail image by solid rows (white/black gaps)
+# NEW: Micro edge strip (1~3px) for tiny white lines
+# =========================
+def micro_strip_lines(
+    pil_img: Image.Image,
+    max_strip: int = 3,
+    white_thr: int = 247,
+    black_thr: int = 8,
+    ratio_thr: float = 0.97,
+):
+    """
+    ✅ 최종 450×633에서 생기는 1~3px 미세 흰줄/검정줄 제거용.
+    - max_strip 이내에서만 제거 (과도 크롭 방지)
+    - ratio_thr: 해당 라인이 거의 전부 흰색/검정이면 제거
+    """
+    img = pil_img.convert("RGB")
+    arr = np.array(img).astype(np.int16)
+    h, w = arr.shape[:2]
+
+    def row_is_micro(y: int) -> bool:
+        row = arr[y, :, :]
+        white_ratio = (row > white_thr).all(axis=1).mean()
+        black_ratio = (row < black_thr).all(axis=1).mean()
+        return white_ratio >= ratio_thr or black_ratio >= ratio_thr
+
+    def col_is_micro(x: int) -> bool:
+        col = arr[:, x, :]
+        white_ratio = (col > white_thr).all(axis=1).mean()
+        black_ratio = (col < black_thr).all(axis=1).mean()
+        return white_ratio >= ratio_thr or black_ratio >= ratio_thr
+
+    top, bottom = 0, h - 1
+    left, right = 0, w - 1
+
+    # 위
+    stripped = 0
+    while stripped < max_strip and top < bottom and row_is_micro(top):
+        top += 1
+        stripped += 1
+
+    # 아래
+    stripped = 0
+    while stripped < max_strip and bottom > top and row_is_micro(bottom):
+        bottom -= 1
+        stripped += 1
+
+    # 좌
+    stripped = 0
+    while stripped < max_strip and left < right and col_is_micro(left):
+        left += 1
+        stripped += 1
+
+    # 우
+    stripped = 0
+    while stripped < max_strip and right > left and col_is_micro(right):
+        right -= 1
+        stripped += 1
+
+    # 너무 작아지면 원본 반환
+    if (bottom - top) < 200 or (right - left) < 200:
+        return img
+
+    if top == 0 and bottom == h - 1 and left == 0 and right == w - 1:
+        return img
+
+    cropped = Image.fromarray(arr[top : bottom + 1, left : right + 1, :].astype(np.uint8))
+    return cropped
+
+
+# =========================
+# Split long detail image by solid rows (white/black gaps)
 # =========================
 def should_split(pil_img: Image.Image) -> bool:
     w, h = pil_img.size
@@ -138,9 +202,6 @@ def split_detail_image_by_solid_rows(
     min_cut_height: int = 220,
     std_thr: float = 9.0,
 ):
-    """
-    긴 이미지에서 "흰 갭" + "검정 갭"을 컷 포인트로 사용해 분할
-    """
     img = pil_img.convert("RGB")
     arr = np.array(img).astype(np.int16)
     h, w = arr.shape[:2]
@@ -180,8 +241,7 @@ def split_detail_image_by_solid_rows(
 
 
 # =========================
-# 3) Subject center estimation (for "centered crop")
-#    - Only shifts crop window center, does NOT zoom in.
+# Subject center estimation (center shift only)
 # =========================
 def estimate_background_color(arr_rgb: np.ndarray) -> np.ndarray:
     h, w = arr_rgb.shape[:2]
@@ -193,89 +253,69 @@ def estimate_background_color(arr_rgb: np.ndarray) -> np.ndarray:
 
 
 def subject_center(pil_img: Image.Image, diff_thr: int = 26):
-    """
-    배경색(코너 중앙값) 대비 색차로 전경을 잡고,
-    전경 픽셀의 중심점을 반환.
-    실패하면 이미지 중앙.
-    """
     img = pil_img.convert("RGB")
     arr = np.array(img).astype(np.int16)
     h, w = arr.shape[:2]
     bg = estimate_background_color(arr)
     diff = np.sqrt(((arr - bg) ** 2).sum(axis=2))
-
     mask = diff > diff_thr
     if not mask.any():
         return (w / 2.0, h / 2.0)
-
     ys, xs = np.where(mask)
-    # 전경이 너무 넓게 잡혀도 "중심점"만 쓰기 때문에 과한 확대 발생 X
-    cx = xs.mean()
-    cy = ys.mean()
-    return (float(cx), float(cy))
+    return (float(xs.mean()), float(ys.mean()))
 
 
 # =========================
-# 4) NO DISTORTION: Uniform cover resize then crop
-#    - Fill 450x633 without any bars
-#    - Never non-uniform stretch
+# NO DISTORTION: Uniform cover resize then crop
 # =========================
 def resize_cover_then_crop(pil_img: Image.Image, center_xy=None):
-    """
-    핵심:
-    1) 비율 유지(Uniform)로만 리사이즈
-    2) 450x633을 "꽉 채우도록" cover 스케일
-    3) 크롭은 center_xy(피사체 중심) 기준으로만 이동
-       => 과한 확대/변형 느낌 최소화
-    """
     img = pil_img.convert("RGB")
     W, H = img.size
 
-    # cover scale (uniform)
     scale = max(TARGET_W / W, TARGET_H / H)
     new_w = int(round(W * scale))
     new_h = int(round(H * scale))
 
-    # 한 번만 리사이즈 (비율 유지!)
     resized = img.resize((new_w, new_h), Image.LANCZOS)
 
-    # center
     if center_xy is None:
         cx, cy = (new_w / 2.0, new_h / 2.0)
     else:
         ox, oy = center_xy
         cx, cy = (ox * scale, oy * scale)
 
-    # crop window (fixed)
     left = int(round(cx - TARGET_W / 2.0))
     top = int(round(cy - TARGET_H / 2.0))
 
-    # clamp
     left = max(0, min(left, new_w - TARGET_W))
     top = max(0, min(top, new_h - TARGET_H))
 
-    out = resized.crop((left, top, left + TARGET_W, top + TARGET_H))
-    return out
+    return resized.crop((left, top, left + TARGET_W, top + TARGET_H))
 
 
 def make_thumb_450x633(pil_img: Image.Image):
-    # A) 먼저 가장자리 띠(흰/검정)만 보수적으로 제거
+    # (A) 보수적 띠 제거(큰 흰/검정 바)
     cut = trim_edge_bands(pil_img)
 
-    # B) 피사체 중심점만 계산 (확대/축소에는 관여 X)
+    # (B) 중심점 계산(확대/축소에 관여 X)
     cxy = subject_center(cut, diff_thr=26)
 
-    # C) 비율 유지 cover 리사이즈 후, 피사체 중심으로 크롭
+    # (C) 비율 유지 cover + 중심 이동 크롭
     out = resize_cover_then_crop(cut, center_xy=cxy)
 
-    # D) 마지막으로 아주 얇은 가장자리 띠가 남는 경우만 한번 더 제거(보수적으로)
-    out2 = trim_edge_bands(out, solid_ratio_thr=0.995, std_thr=6.5, min_run=2)
+    # (D) ✅ 미세 흰줄/검정줄(1~3px) 제거
+    out2 = micro_strip_lines(out, max_strip=3, ratio_thr=0.97)
+
+    # (E) 크기가 줄었으면 “같은 원칙(cover)”으로 다시 450×633 복구 (비율 왜곡 금지)
     if out2.size != (TARGET_W, TARGET_H):
-        # 크기가 달라지면 다시 "같은 방식"으로만 복구(비율 왜곡 금지)
-        # (보통 1~2px 트림에서만 발생)
         out2 = resize_cover_then_crop(out2, center_xy=subject_center(out2, diff_thr=26))
 
-    return out2
+    # (F) 마지막으로 한 번 더 micro strip (보간으로 새로 생기는 1px 라인 방지)
+    out3 = micro_strip_lines(out2, max_strip=2, ratio_thr=0.975)
+    if out3.size != (TARGET_W, TARGET_H):
+        out3 = resize_cover_then_crop(out3, center_xy=subject_center(out3, diff_thr=26))
+
+    return out3
 
 
 # =========================
@@ -360,7 +400,7 @@ st.markdown(
     <div class="misharp-title-wrap">
       <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
       <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V1</div>
-      <div class="misharp-caption">⚠️ 비율 왜곡(늘림/비틀림) 없이: Cover(꽉채움) + 피사체 중심 이동으로만 450×633 생성</div>
+      <div class="misharp-caption">비율 왜곡(늘림/비틀림) 없이: Cover(꽉채움) + 중심 이동 크롭 + 미세 흰줄(1~3px) 제거</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -368,12 +408,11 @@ st.markdown(
 
 with st.expander("고급 옵션", expanded=False):
     max_images = st.slider("상세영역에서 수집할 최대 이미지 수", 50, 600, 250, step=50)
-    st.write("※ 변형 금지 원칙: 비율 유지(Uniform) 리사이즈만 사용합니다.")
-    st.write("※ 여백 금지 원칙: 450×633을 '꽉 채우는(Cover)' 방식으로만 생성합니다.")
-    st.write("※ 피사체 중앙 정렬: 전경 중심점(Subject Center)으로 크롭 중심만 이동합니다.")
+    st.write("※ 변형 금지: 비율 유지(Uniform) 리사이즈만 사용합니다.")
+    st.write("※ 여백 금지: 450×633은 Cover(꽉채움) 방식으로만 생성합니다.")
+    st.write("※ 미세 흰줄 제거: 최종 결과에서 1~3px 라인을 추가로 제거합니다.")
 
 tab1, tab2, tab3 = st.tabs(["① 상세페이지 URL", "② 이미지 주소(URL)", "③ 이미지 업로드"])
-
 all_outputs = []
 
 with tab1:
@@ -429,18 +468,13 @@ with tab3:
                     continue
 
 if all_outputs:
-    fixed = []
-    for name, img in all_outputs:
-        # 여기서는 이미 450x633로 만들어짐
-        fixed.append((name, img))
-
-    st.success(f"총 {len(fixed)}장 생성 완료 (모두 {TARGET_W}×{TARGET_H}, 비율 왜곡 0 / 여백 0)")
+    st.success(f"총 {len(all_outputs)}장 생성 완료 (모두 {TARGET_W}×{TARGET_H}, 미세 흰줄 제거 포함)")
     st.subheader("미리보기 (일부)")
-    st.image([img for _, img in fixed[:24]], width=180)
+    st.image([img for _, img in all_outputs[:24]], width=180)
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, img in fixed:
+        for name, img in all_outputs:
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=95)
             zf.writestr(name, buf.getvalue())
