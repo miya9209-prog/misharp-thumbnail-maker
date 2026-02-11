@@ -13,7 +13,6 @@ from PIL import Image
 # Output size (fixed)
 # =========================
 TARGET_W, TARGET_H = 450, 633
-TARGET_AR = TARGET_W / TARGET_H
 
 HEADERS = {
     "User-Agent": (
@@ -38,7 +37,7 @@ def download_image(url: str) -> Image.Image:
 
 
 # =========================
-# Edge band trim (white/black) - conservative
+# 1) Conservative edge band trim (big white/black bars only)
 # =========================
 def trim_edge_bands(
     pil_img: Image.Image,
@@ -117,76 +116,7 @@ def trim_edge_bands(
 
 
 # =========================
-# NEW: Micro edge strip (1~3px) for tiny white lines
-# =========================
-def micro_strip_lines(
-    pil_img: Image.Image,
-    max_strip: int = 3,
-    white_thr: int = 247,
-    black_thr: int = 8,
-    ratio_thr: float = 0.97,
-):
-    """
-    ✅ 최종 450×633에서 생기는 1~3px 미세 흰줄/검정줄 제거용.
-    - max_strip 이내에서만 제거 (과도 크롭 방지)
-    - ratio_thr: 해당 라인이 거의 전부 흰색/검정이면 제거
-    """
-    img = pil_img.convert("RGB")
-    arr = np.array(img).astype(np.int16)
-    h, w = arr.shape[:2]
-
-    def row_is_micro(y: int) -> bool:
-        row = arr[y, :, :]
-        white_ratio = (row > white_thr).all(axis=1).mean()
-        black_ratio = (row < black_thr).all(axis=1).mean()
-        return white_ratio >= ratio_thr or black_ratio >= ratio_thr
-
-    def col_is_micro(x: int) -> bool:
-        col = arr[:, x, :]
-        white_ratio = (col > white_thr).all(axis=1).mean()
-        black_ratio = (col < black_thr).all(axis=1).mean()
-        return white_ratio >= ratio_thr or black_ratio >= ratio_thr
-
-    top, bottom = 0, h - 1
-    left, right = 0, w - 1
-
-    # 위
-    stripped = 0
-    while stripped < max_strip and top < bottom and row_is_micro(top):
-        top += 1
-        stripped += 1
-
-    # 아래
-    stripped = 0
-    while stripped < max_strip and bottom > top and row_is_micro(bottom):
-        bottom -= 1
-        stripped += 1
-
-    # 좌
-    stripped = 0
-    while stripped < max_strip and left < right and col_is_micro(left):
-        left += 1
-        stripped += 1
-
-    # 우
-    stripped = 0
-    while stripped < max_strip and right > left and col_is_micro(right):
-        right -= 1
-        stripped += 1
-
-    # 너무 작아지면 원본 반환
-    if (bottom - top) < 200 or (right - left) < 200:
-        return img
-
-    if top == 0 and bottom == h - 1 and left == 0 and right == w - 1:
-        return img
-
-    cropped = Image.fromarray(arr[top : bottom + 1, left : right + 1, :].astype(np.uint8))
-    return cropped
-
-
-# =========================
-# Split long detail image by solid rows (white/black gaps)
+# 2) Split long detail image by solid rows (white/black gaps)
 # =========================
 def should_split(pil_img: Image.Image) -> bool:
     w, h = pil_img.size
@@ -241,7 +171,7 @@ def split_detail_image_by_solid_rows(
 
 
 # =========================
-# Subject center estimation (center shift only)
+# 3) Subject center (shift crop center only)
 # =========================
 def estimate_background_color(arr_rgb: np.ndarray) -> np.ndarray:
     h, w = arr_rgb.shape[:2]
@@ -266,7 +196,7 @@ def subject_center(pil_img: Image.Image, diff_thr: int = 26):
 
 
 # =========================
-# NO DISTORTION: Uniform cover resize then crop
+# 4) Uniform cover resize then crop (NO distortion)
 # =========================
 def resize_cover_then_crop(pil_img: Image.Image, center_xy=None):
     img = pil_img.convert("RGB")
@@ -293,29 +223,50 @@ def resize_cover_then_crop(pil_img: Image.Image, center_xy=None):
     return resized.crop((left, top, left + TARGET_W, top + TARGET_H))
 
 
+# =========================
+# 5) NEW: Edge bleed fix (kills 1px white lines without cropping)
+# =========================
+def edge_bleed_fix(pil_img: Image.Image, n: int = 2):
+    """
+    ✅ 450×633 최종 이미지에서:
+    가장자리 1~2px 라인을 "안쪽 픽셀"로 덮어써서 흰줄/검정줄을 물리적으로 제거.
+    - 크기 변화 없음
+    - 프레이밍 변화 없음
+    - 늘림/변형 없음
+    """
+    img = pil_img.convert("RGB")
+    arr = np.array(img).copy()
+    h, w = arr.shape[:2]
+    n = max(1, min(n, 4))
+    if h <= 2 * n + 2 or w <= 2 * n + 2:
+        return img
+
+    # top n rows <- row n
+    arr[0:n, :, :] = arr[n : n + 1, :, :]
+    # bottom n rows <- row h-1-n
+    arr[h - n : h, :, :] = arr[h - n - 1 : h - n, :, :]
+    # left n cols <- col n
+    arr[:, 0:n, :] = arr[:, n : n + 1, :]
+    # right n cols <- col w-1-n
+    arr[:, w - n : w, :] = arr[:, w - n - 1 : w - n, :]
+
+    return Image.fromarray(arr)
+
+
 def make_thumb_450x633(pil_img: Image.Image):
-    # (A) 보수적 띠 제거(큰 흰/검정 바)
+    # A) 큰 띠 제거(흰/검정 바)
     cut = trim_edge_bands(pil_img)
 
-    # (B) 중심점 계산(확대/축소에 관여 X)
+    # B) 피사체 중심(중심 이동만)
     cxy = subject_center(cut, diff_thr=26)
 
-    # (C) 비율 유지 cover + 중심 이동 크롭
+    # C) 비율 유지 cover + 중심 이동 크롭
     out = resize_cover_then_crop(cut, center_xy=cxy)
 
-    # (D) ✅ 미세 흰줄/검정줄(1~3px) 제거
-    out2 = micro_strip_lines(out, max_strip=3, ratio_thr=0.97)
+    # D) ✅ 1~2px 흰줄 제거는 "크롭"이 아니라 "엣지 덮어쓰기"로 처리
+    out = edge_bleed_fix(out, n=2)
 
-    # (E) 크기가 줄었으면 “같은 원칙(cover)”으로 다시 450×633 복구 (비율 왜곡 금지)
-    if out2.size != (TARGET_W, TARGET_H):
-        out2 = resize_cover_then_crop(out2, center_xy=subject_center(out2, diff_thr=26))
-
-    # (F) 마지막으로 한 번 더 micro strip (보간으로 새로 생기는 1px 라인 방지)
-    out3 = micro_strip_lines(out2, max_strip=2, ratio_thr=0.975)
-    if out3.size != (TARGET_W, TARGET_H):
-        out3 = resize_cover_then_crop(out3, center_xy=subject_center(out3, diff_thr=26))
-
-    return out3
+    return out
 
 
 # =========================
@@ -400,7 +351,7 @@ st.markdown(
     <div class="misharp-title-wrap">
       <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
       <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V1</div>
-      <div class="misharp-caption">비율 왜곡(늘림/비틀림) 없이: Cover(꽉채움) + 중심 이동 크롭 + 미세 흰줄(1~3px) 제거</div>
+      <div class="misharp-caption">비율 왜곡 0 / 여백 0 / 1~2px 흰줄은 엣지 픽셀 덮어쓰기(Edge Bleed)로 제거</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -409,8 +360,8 @@ st.markdown(
 with st.expander("고급 옵션", expanded=False):
     max_images = st.slider("상세영역에서 수집할 최대 이미지 수", 50, 600, 250, step=50)
     st.write("※ 변형 금지: 비율 유지(Uniform) 리사이즈만 사용합니다.")
-    st.write("※ 여백 금지: 450×633은 Cover(꽉채움) 방식으로만 생성합니다.")
-    st.write("※ 미세 흰줄 제거: 최종 결과에서 1~3px 라인을 추가로 제거합니다.")
+    st.write("※ 여백 금지: 450×633 Cover 방식으로만 생성합니다.")
+    st.write("※ 미세 흰줄 금지: 최종 결과 가장자리 1~2px를 안쪽 픽셀로 덮어써서 제거합니다(크기/프레임 유지).")
 
 tab1, tab2, tab3 = st.tabs(["① 상세페이지 URL", "② 이미지 주소(URL)", "③ 이미지 업로드"])
 all_outputs = []
@@ -468,7 +419,7 @@ with tab3:
                     continue
 
 if all_outputs:
-    st.success(f"총 {len(all_outputs)}장 생성 완료 (모두 {TARGET_W}×{TARGET_H}, 미세 흰줄 제거 포함)")
+    st.success(f"총 {len(all_outputs)}장 생성 완료 (모두 {TARGET_W}×{TARGET_H}, 흰줄 제거 포함)")
     st.subheader("미리보기 (일부)")
     st.image([img for _, img in all_outputs[:24]], width=180)
 
