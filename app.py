@@ -22,7 +22,6 @@ HEADERS = {
     )
 }
 
-
 # =========================
 # Utils
 # =========================
@@ -39,70 +38,38 @@ def download_image(url: str) -> Image.Image:
 
 
 # =========================
-# Solid band detection (WHITE / BLACK)
+# 1) Edge band trim (white/black) - conservative
+#    => removes real border bars without eating photo
 # =========================
-def _row_solid_ratio_rgb(arr_rgb: np.ndarray, y: int, mode: str):
-    """
-    mode: 'white' or 'black'
-    """
-    row = arr_rgb[y, :, :].astype(np.int16)
-    # 얼마나 "거의 같은 색"인가 (노이즈 많은 사진 영역 제외)
-    row_std = row.std(axis=0).mean()
-    row_mean = row.mean()
-
-    if mode == "white":
-        # 대부분이 아주 밝고, 균일하면 흰 띠로 판정
-        solid = (row > 245).all(axis=1).mean()
-        return solid, row_mean, row_std
-    else:
-        # 대부분이 아주 어둡고, 균일하면 검정 띠로 판정
-        solid = (row < 12).all(axis=1).mean()
-        return solid, row_mean, row_std
-
-
-def _col_solid_ratio_rgb(arr_rgb: np.ndarray, x: int, mode: str):
-    col = arr_rgb[:, x, :].astype(np.int16)
-    col_std = col.std(axis=0).mean()
-    col_mean = col.mean()
-
-    if mode == "white":
-        solid = (col > 245).all(axis=1).mean()
-        return solid, col_mean, col_std
-    else:
-        solid = (col < 12).all(axis=1).mean()
-        return solid, col_mean, col_std
-
-
 def trim_edge_bands(
     pil_img: Image.Image,
-    solid_ratio_thr: float = 0.985,
-    std_thr: float = 8.0,
-    min_run: int = 8,
+    solid_ratio_thr: float = 0.992,
+    std_thr: float = 7.5,
+    min_run: int = 10,
+    white_thr: int = 246,
+    black_thr: int = 9,
 ):
     """
-    ✅ 가장자리의 '흰 띠' / '검정 띠'를 실제로 잘라냅니다.
-    - solid_ratio_thr: 행/열 픽셀의 몇 %가 거의 흰/검정이면 띠로 볼지
-    - std_thr: 색 변화가 거의 없는(균일한) 띠만 제거(사진 영역 오검출 방지)
-    - min_run: 최소 몇 줄 이상 연속될 때만 잘라냄
+    가장자리의 "거의 흰 띠" / "거의 검정 띠"를 실제로 잘라냅니다.
+    - 아주 보수적으로 동작하도록 설정(사진 영역 오검출 최소화)
     """
     img = pil_img.convert("RGB")
-    arr = np.array(img)
+    arr = np.array(img).astype(np.int16)
     h, w = arr.shape[:2]
 
     def row_is_band(y: int) -> bool:
-        # white OR black band
-        solid_w, mean_w, std_w = _row_solid_ratio_rgb(arr, y, "white")
-        solid_b, mean_b, std_b = _row_solid_ratio_rgb(arr, y, "black")
-        return (solid_w >= solid_ratio_thr and std_w <= std_thr) or (
-            solid_b >= solid_ratio_thr and std_b <= std_thr
-        )
+        row = arr[y, :, :]
+        row_std = row.std(axis=0).mean()
+        white_ratio = (row > white_thr).all(axis=1).mean()
+        black_ratio = (row < black_thr).all(axis=1).mean()
+        return row_std <= std_thr and (white_ratio >= solid_ratio_thr or black_ratio >= solid_ratio_thr)
 
     def col_is_band(x: int) -> bool:
-        solid_w, mean_w, std_w = _col_solid_ratio_rgb(arr, x, "white")
-        solid_b, mean_b, std_b = _col_solid_ratio_rgb(arr, x, "black")
-        return (solid_w >= solid_ratio_thr and std_w <= std_thr) or (
-            solid_b >= solid_ratio_thr and std_b <= std_thr
-        )
+        col = arr[:, x, :]
+        col_std = col.std(axis=0).mean()
+        white_ratio = (col > white_thr).all(axis=1).mean()
+        black_ratio = (col < black_thr).all(axis=1).mean()
+        return col_std <= std_thr and (white_ratio >= solid_ratio_thr or black_ratio >= solid_ratio_thr)
 
     top, bottom = 0, h - 1
     left, right = 0, w - 1
@@ -138,16 +105,16 @@ def trim_edge_bands(
         if run >= min_run:
             changed = True
 
-        # 과도한 트림 방지
-        if (bottom - top) < 140 or (right - left) < 140:
+        # 과도 트림 방지
+        if (bottom - top) < 200 or (right - left) < 200:
             return img
 
         if not changed:
             break
 
         arr = arr[top : bottom + 1, left : right + 1, :]
-        img = Image.fromarray(arr)
-        arr = np.array(img)
+        img = Image.fromarray(arr.astype(np.uint8))
+        arr = np.array(img).astype(np.int16)
         h, w = arr.shape[:2]
         top, bottom, left, right = 0, h - 1, 0, w - 1
 
@@ -155,25 +122,29 @@ def trim_edge_bands(
 
 
 # =========================
-# Split long detail image into pieces by WHITE/BLACK gaps
+# 2) Split long detail image by solid rows (white/black gaps)
 # =========================
+def should_split(pil_img: Image.Image) -> bool:
+    w, h = pil_img.size
+    return h >= int(w * 2.0)
+
+
 def split_detail_image_by_solid_rows(
     pil_img: Image.Image,
-    white_thr: int = 245,
-    black_thr: int = 12,
-    solid_ratio: float = 0.985,
+    white_thr: int = 246,
+    black_thr: int = 9,
+    solid_ratio: float = 0.992,
     min_gap: int = 70,
     min_cut_height: int = 220,
-    std_thr: float = 10.0,
+    std_thr: float = 9.0,
 ):
     """
-    ✅ 긴 상세이미지를 '흰 갭' 뿐 아니라 '검정 갭(검정 구분띠)'도 컷 포인트로 사용.
+    긴 이미지에서 "흰 갭" + "검정 갭"을 컷 포인트로 사용해 분할
     """
     img = pil_img.convert("RGB")
     arr = np.array(img).astype(np.int16)
     h, w = arr.shape[:2]
 
-    # row마다 "거의 흰색" 비율 / "거의 검정" 비율 / 표준편차(균일성)
     row_white = (arr > white_thr).all(axis=2).mean(axis=1)
     row_black = (arr < black_thr).all(axis=2).mean(axis=1)
     row_std = arr.std(axis=1).mean(axis=1)
@@ -208,13 +179,9 @@ def split_detail_image_by_solid_rows(
     return cuts
 
 
-def should_split(pil_img: Image.Image) -> bool:
-    w, h = pil_img.size
-    return h >= int(w * 2.0)
-
-
 # =========================
-# Foreground detection (bbox + center) with "band ignore"
+# 3) Subject center estimation (for "centered crop")
+#    - Only shifts crop window center, does NOT zoom in.
 # =========================
 def estimate_background_color(arr_rgb: np.ndarray) -> np.ndarray:
     h, w = arr_rgb.shape[:2]
@@ -225,124 +192,90 @@ def estimate_background_color(arr_rgb: np.ndarray) -> np.ndarray:
     return np.median(corners, axis=0)
 
 
-def foreground_mask(arr_rgb: np.ndarray, diff_thr: int = 24) -> np.ndarray:
-    arr = arr_rgb.astype(np.int16)
+def subject_center(pil_img: Image.Image, diff_thr: int = 26):
+    """
+    배경색(코너 중앙값) 대비 색차로 전경을 잡고,
+    전경 픽셀의 중심점을 반환.
+    실패하면 이미지 중앙.
+    """
+    img = pil_img.convert("RGB")
+    arr = np.array(img).astype(np.int16)
+    h, w = arr.shape[:2]
     bg = estimate_background_color(arr)
     diff = np.sqrt(((arr - bg) ** 2).sum(axis=2))
-    return diff > diff_thr
 
-
-def foreground_bbox_center(pil_img: Image.Image, diff_thr: int = 24):
-    """
-    ✅ 전경 bbox를 잡을 때, 가장자리 band(흰/검정 띠)가 남아있다면
-    먼저 trim_edge_bands()로 제거하고 들어가도록 위에서 처리합니다.
-    """
-    img = pil_img.convert("RGB")
-    arr = np.array(img)
-    h, w = arr.shape[:2]
-
-    mask = foreground_mask(arr, diff_thr=diff_thr)
+    mask = diff > diff_thr
     if not mask.any():
-        return (0, 0, w - 1, h - 1), (w / 2.0, h / 2.0)
+        return (w / 2.0, h / 2.0)
 
     ys, xs = np.where(mask)
-    x1, x2 = xs.min(), xs.max()
-    y1, y2 = ys.min(), ys.max()
-
-    cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0
-    return (x1, y1, x2, y2), (cx, cy)
+    # 전경이 너무 넓게 잡혀도 "중심점"만 쓰기 때문에 과한 확대 발생 X
+    cx = xs.mean()
+    cy = ys.mean()
+    return (float(cx), float(cy))
 
 
 # =========================
-# Crop strategy (bbox-fit + aspect fill)
+# 4) NO DISTORTION: Uniform cover resize then crop
+#    - Fill 450x633 without any bars
+#    - Never non-uniform stretch
 # =========================
-def crop_around_bbox_to_aspect(
-    pil_img: Image.Image,
-    target_ar: float,
-    bbox,
-    center,
-    pad_ratio: float = 0.16,
-):
+def resize_cover_then_crop(pil_img: Image.Image, center_xy=None):
+    """
+    핵심:
+    1) 비율 유지(Uniform)로만 리사이즈
+    2) 450x633을 "꽉 채우도록" cover 스케일
+    3) 크롭은 center_xy(피사체 중심) 기준으로만 이동
+       => 과한 확대/변형 느낌 최소화
+    """
     img = pil_img.convert("RGB")
     W, H = img.size
-    x1, y1, x2, y2 = bbox
-    cx, cy = center
 
-    bw = max(1, (x2 - x1))
-    bh = max(1, (y2 - y1))
+    # cover scale (uniform)
+    scale = max(TARGET_W / W, TARGET_H / H)
+    new_w = int(round(W * scale))
+    new_h = int(round(H * scale))
 
-    pad_w = int(round(bw * pad_ratio))
-    pad_h = int(round(bh * pad_ratio))
+    # 한 번만 리사이즈 (비율 유지!)
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
 
-    rx1 = int(max(0, x1 - pad_w))
-    ry1 = int(max(0, y1 - pad_h))
-    rx2 = int(min(W - 1, x2 + pad_w))
-    ry2 = int(min(H - 1, y2 + pad_h))
-
-    rw = max(1, rx2 - rx1)
-    rh = max(1, ry2 - ry1)
-
-    roi_ar = rw / rh
-    if roi_ar > target_ar:
-        crop_w = rw
-        crop_h = int(round(crop_w / target_ar))
+    # center
+    if center_xy is None:
+        cx, cy = (new_w / 2.0, new_h / 2.0)
     else:
-        crop_h = rh
-        crop_w = int(round(target_ar * crop_h))
+        ox, oy = center_xy
+        cx, cy = (ox * scale, oy * scale)
 
-    # 중심 기준 배치
-    left = int(round(cx - crop_w / 2))
-    top = int(round(cy - crop_h / 2))
+    # crop window (fixed)
+    left = int(round(cx - TARGET_W / 2.0))
+    top = int(round(cy - TARGET_H / 2.0))
 
-    # 클램프
-    crop_w = min(crop_w, W)
-    crop_h = min(crop_h, H)
+    # clamp
+    left = max(0, min(left, new_w - TARGET_W))
+    top = max(0, min(top, new_h - TARGET_H))
 
-    left = max(0, min(left, W - crop_w))
-    top = max(0, min(top, H - crop_h))
-
-    return img.crop((left, top, left + crop_w, top + crop_h))
-
-
-def final_safe_trim_after_resize(pil_img: Image.Image):
-    """
-    ✅ 최종 450×633 리사이즈 후:
-    혹시 남은 1~3px 수준의 흰/검정 테두리까지 제거 → 다시 450×633
-    """
-    trimmed = trim_edge_bands(
-        pil_img,
-        solid_ratio_thr=0.992,
-        std_thr=9.0,
-        min_run=2,
-    )
-    if trimmed.size != (TARGET_W, TARGET_H):
-        trimmed = trimmed.resize((TARGET_W, TARGET_H), Image.LANCZOS)
-    return trimmed
+    out = resized.crop((left, top, left + TARGET_W, top + TARGET_H))
+    return out
 
 
 def make_thumb_450x633(pil_img: Image.Image):
-    # (A) 먼저 흰/검정 띠 제거 (가장 중요)
+    # A) 먼저 가장자리 띠(흰/검정)만 보수적으로 제거
     cut = trim_edge_bands(pil_img)
 
-    # (B) 전경 bbox/center
-    bbox, center = foreground_bbox_center(cut, diff_thr=24)
+    # B) 피사체 중심점만 계산 (확대/축소에는 관여 X)
+    cxy = subject_center(cut, diff_thr=26)
 
-    # (C) bbox 기반 중앙 크롭
-    cropped = crop_around_bbox_to_aspect(
-        cut,
-        TARGET_AR,
-        bbox=bbox,
-        center=center,
-        pad_ratio=0.16,
-    )
+    # C) 비율 유지 cover 리사이즈 후, 피사체 중심으로 크롭
+    out = resize_cover_then_crop(cut, center_xy=cxy)
 
-    # (D) 최종 리사이즈
-    out = cropped.resize((TARGET_W, TARGET_H), Image.LANCZOS)
+    # D) 마지막으로 아주 얇은 가장자리 띠가 남는 경우만 한번 더 제거(보수적으로)
+    out2 = trim_edge_bands(out, solid_ratio_thr=0.995, std_thr=6.5, min_run=2)
+    if out2.size != (TARGET_W, TARGET_H):
+        # 크기가 달라지면 다시 "같은 방식"으로만 복구(비율 왜곡 금지)
+        # (보통 1~2px 트림에서만 발생)
+        out2 = resize_cover_then_crop(out2, center_xy=subject_center(out2, diff_thr=26))
 
-    # (E) 마지막 안전 트림(흰/검정 모두)
-    out = final_safe_trim_after_resize(out)
-    return out
+    return out2
 
 
 # =========================
@@ -402,12 +335,9 @@ def process_image_any(pil_img: Image.Image, prefix: str):
 
         for idx, (y1, y2) in enumerate(segments, start=1):
             piece = pil_img.crop((0, y1, pil_img.width, y2))
-            # 조각도 먼저 띠 제거
-            piece = trim_edge_bands(piece)
             thumb = make_thumb_450x633(piece)
             outputs.append((f"{prefix}_{idx:02d}_{TARGET_W}x{TARGET_H}.jpg", thumb))
     else:
-        pil_img = trim_edge_bands(pil_img)
         thumb = make_thumb_450x633(pil_img)
         outputs.append((f"{prefix}_01_{TARGET_W}x{TARGET_H}.jpg", thumb))
 
@@ -430,7 +360,7 @@ st.markdown(
     <div class="misharp-title-wrap">
       <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
       <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V1</div>
-      <div class="misharp-caption">본문 상세영역 이미지에서만 추출 → 450×633 / 흰·검정 띠 제거 / 피사체 중앙 크롭</div>
+      <div class="misharp-caption">⚠️ 비율 왜곡(늘림/비틀림) 없이: Cover(꽉채움) + 피사체 중심 이동으로만 450×633 생성</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -438,8 +368,9 @@ st.markdown(
 
 with st.expander("고급 옵션", expanded=False):
     max_images = st.slider("상세영역에서 수집할 최대 이미지 수", 50, 600, 250, step=50)
-    st.write("※ 검정 바(하단 검정 띠) 문제를 막기 위해: 가장자리 '흰/검정 띠'를 자동 제거합니다.")
-    st.write("※ 긴 이미지 분할 시: 흰 갭 + 검정 갭 모두 컷 포인트로 사용합니다.")
+    st.write("※ 변형 금지 원칙: 비율 유지(Uniform) 리사이즈만 사용합니다.")
+    st.write("※ 여백 금지 원칙: 450×633을 '꽉 채우는(Cover)' 방식으로만 생성합니다.")
+    st.write("※ 피사체 중앙 정렬: 전경 중심점(Subject Center)으로 크롭 중심만 이동합니다.")
 
 tab1, tab2, tab3 = st.tabs(["① 상세페이지 URL", "② 이미지 주소(URL)", "③ 이미지 업로드"])
 
@@ -500,11 +431,10 @@ with tab3:
 if all_outputs:
     fixed = []
     for name, img in all_outputs:
-        img = img.resize((TARGET_W, TARGET_H), Image.LANCZOS)
-        img = final_safe_trim_after_resize(img)
+        # 여기서는 이미 450x633로 만들어짐
         fixed.append((name, img))
 
-    st.success(f"총 {len(fixed)}장 생성 완료 (모두 {TARGET_W}×{TARGET_H}, 검정/흰 띠 자동 제거)")
+    st.success(f"총 {len(fixed)}장 생성 완료 (모두 {TARGET_W}×{TARGET_H}, 비율 왜곡 0 / 여백 0)")
     st.subheader("미리보기 (일부)")
     st.image([img for _, img in fixed[:24]], width=180)
 
