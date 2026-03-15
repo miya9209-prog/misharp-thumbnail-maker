@@ -171,28 +171,114 @@ def split_detail_image_by_solid_rows(
 
 
 # =========================
-# 3) Subject center (shift crop center only)
+# 3) Subject center (keep subject as close to frame center as possible)
 # =========================
 def estimate_background_color(arr_rgb: np.ndarray) -> np.ndarray:
     h, w = arr_rgb.shape[:2]
-    corners = np.array(
-        [arr_rgb[0, 0], arr_rgb[0, w - 1], arr_rgb[h - 1, 0], arr_rgb[h - 1, w - 1]],
-        dtype=np.int16,
-    )
-    return np.median(corners, axis=0)
+    band = max(2, min(h, w) // 30)
+
+    border = np.concatenate(
+        [
+            arr_rgb[:band, :, :].reshape(-1, 3),
+            arr_rgb[h - band :, :, :].reshape(-1, 3),
+            arr_rgb[:, :band, :].reshape(-1, 3),
+            arr_rgb[:, w - band :, :].reshape(-1, 3),
+        ],
+        axis=0,
+    ).astype(np.int16)
+
+    return np.median(border, axis=0)
 
 
-def subject_center(pil_img: Image.Image, diff_thr: int = 26):
+def _subject_bbox_from_bg_diff(arr: np.ndarray, bg: np.ndarray):
+    h, w = arr.shape[:2]
+
+    diff = np.sqrt(((arr - bg) ** 2).sum(axis=2))
+    luminance = arr.mean(axis=2)
+    bg_lum = float(bg.mean())
+    lum_diff = np.abs(luminance - bg_lum)
+
+    # 배경이 매우 밝은 컷이 많아, 색차 + 밝기차를 함께 봅니다.
+    mask = (diff > 24) | (lum_diff > 18)
+
+    # 작은 잡음 제거: 행/열 방향으로 너무 적은 픽셀은 제외
+    row_ratio = mask.mean(axis=1)
+    col_ratio = mask.mean(axis=0)
+
+    rows = np.where(row_ratio > 0.01)[0]
+    cols = np.where(col_ratio > 0.01)[0]
+
+    if len(rows) == 0 or len(cols) == 0:
+        return None
+
+    top, bottom = int(rows[0]), int(rows[-1])
+    left, right = int(cols[0]), int(cols[-1])
+
+    # 지나치게 조이는 박스 방지: 약간의 숨통을 줍니다.
+    pad_x = max(6, int((right - left + 1) * 0.05))
+    pad_y = max(8, int((bottom - top + 1) * 0.05))
+
+    left = max(0, left - pad_x)
+    right = min(w - 1, right + pad_x)
+    top = max(0, top - pad_y)
+    bottom = min(h - 1, bottom + pad_y)
+
+    if (right - left) < max(40, int(w * 0.08)) or (bottom - top) < max(60, int(h * 0.08)):
+        return None
+
+    return (left, top, right, bottom)
+
+
+def _subject_bbox_from_edge_energy(arr: np.ndarray):
+    h, w = arr.shape[:2]
+    gray = arr.mean(axis=2)
+
+    gx = np.abs(np.diff(gray, axis=1))
+    gy = np.abs(np.diff(gray, axis=0))
+
+    col_energy = np.pad(gx.sum(axis=0), (0, 1))
+    row_energy = np.pad(gy.sum(axis=1), (0, 1))
+
+    col_thr = np.percentile(col_energy, 65)
+    row_thr = np.percentile(row_energy, 65)
+
+    cols = np.where(col_energy > col_thr)[0]
+    rows = np.where(row_energy > row_thr)[0]
+
+    if len(rows) == 0 or len(cols) == 0:
+        return None
+
+    left, right = int(cols[0]), int(cols[-1])
+    top, bottom = int(rows[0]), int(rows[-1])
+
+    pad_x = max(6, int((right - left + 1) * 0.04))
+    pad_y = max(8, int((bottom - top + 1) * 0.04))
+
+    left = max(0, left - pad_x)
+    right = min(w - 1, right + pad_x)
+    top = max(0, top - pad_y)
+    bottom = min(h - 1, bottom + pad_y)
+
+    return (left, top, right, bottom)
+
+
+def subject_center(pil_img: Image.Image):
     img = pil_img.convert("RGB")
     arr = np.array(img).astype(np.int16)
     h, w = arr.shape[:2]
     bg = estimate_background_color(arr)
-    diff = np.sqrt(((arr - bg) ** 2).sum(axis=2))
-    mask = diff > diff_thr
-    if not mask.any():
+
+    bbox = _subject_bbox_from_bg_diff(arr, bg)
+    if bbox is None:
+        bbox = _subject_bbox_from_edge_energy(arr)
+
+    if bbox is None:
         return (w / 2.0, h / 2.0)
-    ys, xs = np.where(mask)
-    return (float(xs.mean()), float(ys.mean()))
+
+    left, top, right, bottom = bbox
+    cx = (left + right) / 2.0
+    cy = (top + bottom) / 2.0
+    return (float(cx), float(cy))
 
 
 # =========================
@@ -258,7 +344,7 @@ def make_thumb_450x633(pil_img: Image.Image):
     cut = trim_edge_bands(pil_img)
 
     # B) 피사체 중심(중심 이동만)
-    cxy = subject_center(cut, diff_thr=26)
+    cxy = subject_center(cut)
 
     # C) 비율 유지 cover + 중심 이동 크롭
     out = resize_cover_then_crop(cut, center_xy=cxy)
@@ -351,7 +437,7 @@ st.markdown(
     <div class="misharp-title-wrap">
       <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
       <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V1</div>
-      <div class="misharp-caption">비율 왜곡 0 / 여백 0 / 1~2px 흰줄은 엣지 픽셀 덮어쓰기(Edge Bleed)로 제거</div>
+      <div class="misharp-caption">비율 왜곡 0 / 여백 0 / 피사체 중앙 정렬 강화 / 1~2px 흰줄은 Edge Bleed로 제거</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -361,6 +447,7 @@ with st.expander("고급 옵션", expanded=False):
     max_images = st.slider("상세영역에서 수집할 최대 이미지 수", 50, 600, 250, step=50)
     st.write("※ 변형 금지: 비율 유지(Uniform) 리사이즈만 사용합니다.")
     st.write("※ 여백 금지: 450×633 Cover 방식으로만 생성합니다.")
+    st.write("※ 피사체 중앙 정렬 강화: 배경색 차이 + 윤곽 에너지 기준으로 피사체 박스를 잡아 최대한 중앙에 오도록 이동 크롭합니다.")
     st.write("※ 미세 흰줄 금지: 최종 결과 가장자리 1~2px를 안쪽 픽셀로 덮어써서 제거합니다(크기/프레임 유지).")
 
 tab1, tab2, tab3 = st.tabs(["① 상세페이지 URL", "② 이미지 주소(URL)", "③ 이미지 업로드"])
