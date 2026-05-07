@@ -188,7 +188,7 @@ def is_text_or_notice_image(pil_img: Image.Image) -> bool:
 
 def has_usable_subject(pil_img: Image.Image) -> bool:
     """썸네일 소재 판단.
-    v5 기준: 모델컷뿐 아니라 행거컷, 원단컷, 허리/밑단/봉제 디테일컷도 허용합니다.
+    v6 기준: 모델컷뿐 아니라 행거컷, 원단컷, 허리/밑단/봉제 디테일컷도 허용합니다.
     제외 대상은 피사체 없는 공지/사이즈표/텍스트 카드/빈 배경입니다.
     """
     img = trim_edge_bands(pil_img).convert("RGB")
@@ -196,6 +196,8 @@ def has_usable_subject(pil_img: Image.Image) -> bool:
     if w < 160 or h < 160:
         return False
     if is_text_or_notice_image(img):
+        return False
+    if looks_like_mobile_or_brand_story(img):
         return False
 
     arr = np.array(img)
@@ -384,6 +386,90 @@ def has_visual_product(pil_img: Image.Image) -> bool:
             return True
     return (white < 0.82 and (edge > 0.0045 or texture_std > 9.0 or sat.mean() > 2.8))
 
+
+
+def image_content_stats(pil_img: Image.Image) -> dict:
+    img = trim_edge_bands(pil_img).convert("RGB") if 'trim_edge_bands' in globals() else pil_img.convert("RGB")
+    arr = np.array(img).astype(np.int16)
+    h, w = arr.shape[:2]
+    lum = arr.mean(axis=2)
+    sat = arr.max(axis=2) - arr.min(axis=2)
+    gray = lum.astype(np.float32)
+    edge = ((np.abs(np.diff(gray, axis=1)) > 18).mean() + (np.abs(np.diff(gray, axis=0)) > 18).mean()) / 2 if h > 2 and w > 2 else 0
+    white = ((arr[:, :, 0] > 242) & (arr[:, :, 1] > 242) & (arr[:, :, 2] > 242)).mean()
+    light_plain = ((lum > 224) & (sat < 24)).mean()
+    dark_ink = (lum < 115).mean()
+    return {"w": w, "h": h, "edge": float(edge), "white": float(white), "light_plain": float(light_plain), "dark_ink": float(dark_ink), "std": float(gray.std()), "sat_mean": float(sat.mean())}
+
+
+def looks_like_mobile_or_brand_story(pil_img: Image.Image) -> bool:
+    """브랜드스토리, 모바일 캡처 UI, 텍스트 안내 이미지 제외."""
+    img = trim_edge_bands(pil_img).convert("RGB")
+    w, h = img.size
+    arr = np.array(img).astype(np.int16)
+    lum = arr.mean(axis=2)
+    sat = arr.max(axis=2) - arr.min(axis=2)
+    gray = lum.astype(np.float32)
+    # 모바일 캡처/브랜드스토리: 밝은 바탕 + 검정 글자/아이콘 + 실제 상품 bbox 없음/작음
+    bbox = subject_bbox(img)
+    bbox_ratio = 0 if bbox is None else ((bbox[2]-bbox[0])*(bbox[3]-bbox[1]) / float(w*h))
+    dark_ink = (lum < 110).mean()
+    light_plain = ((lum > 218) & (sat < 30)).mean()
+    edge = ((np.abs(np.diff(gray, axis=1)) > 18).mean() + (np.abs(np.diff(gray, axis=0)) > 18).mean()) / 2
+    # 좌우/상하 중 한쪽에 텍스트가 몰린 브랜드 설명 컷
+    left_dark = (lum[:, :max(1, w//2)] < 115).mean()
+    right_dark = (lum[:, w//2:] < 115).mean()
+    text_imbalance = max(left_dark, right_dark) > 0.018 and min(left_dark, right_dark) < 0.007
+    if light_plain > 0.55 and dark_ink > 0.010 and edge > 0.010 and bbox_ratio < 0.18:
+        return True
+    if text_imbalance and bbox_ratio < 0.22:
+        return True
+    # 모바일 화면 캡처: 하단/측면 UI 아이콘, 체크 원형 등 작은 고채도 요소 + 상품 bbox 작음
+    bottom = arr[int(h*0.72):, :, :]
+    if bottom.size:
+        blum = bottom.mean(axis=2)
+        bsat = bottom.max(axis=2) - bottom.min(axis=2)
+        bottom_ink = (blum < 120).mean()
+        bottom_color = (bsat > 60).mean()
+        if bbox_ratio < 0.26 and bottom_ink > 0.010 and bottom_color > 0.002 and light_plain > 0.35:
+            return True
+    return False
+
+
+def is_low_value_generated_piece(pil_img: Image.Image) -> bool:
+    """빈 배경, 너무 잘린 조각, 의미 없는 UI/텍스트컷 방지."""
+    img = trim_edge_bands(pil_img).convert("RGB")
+    w, h = img.size
+    if w < 160 or h < 160:
+        return True
+    stt = image_content_stats(img)
+    if stt["white"] > 0.90 and stt["edge"] < 0.012:
+        return True
+    if looks_like_mobile_or_brand_story(img):
+        return True
+    bbox = subject_bbox(img)
+    if bbox is None:
+        # 원단 확대컷은 허용, 그러나 거의 단색/빈 배경은 제외
+        return not (stt["white"] < 0.82 and (stt["std"] > 9.0 or stt["edge"] > 0.006))
+    l, t, r, b = bbox
+    bw, bh = r-l, b-t
+    bbox_ratio = (bw*bh)/float(w*h)
+    # 피사체가 너무 작고 한쪽에 치우친 결과물은 제외
+    cx = (l+r)/2.0/w
+    cy = (t+b)/2.0/h
+    if bbox_ratio < 0.045:
+        return True
+    if (cx < 0.18 or cx > 0.82 or cy < 0.12 or cy > 0.88) and bbox_ratio < 0.22:
+        return True
+    # 상품 전체컷이 분할되어 상하가 잘린 조각: 피사체가 위/아래 경계를 동시에 강하게 침범하고 전체가 흰 배경이면 제외
+    touches_top = t <= max(3, int(h*0.015))
+    touches_bottom = b >= h - max(3, int(h*0.015))
+    if touches_top and touches_bottom and stt["white"] > 0.38 and bbox_ratio > 0.28:
+        # 원단 클로즈업은 흰 배경 비율이 낮거나 bbox 개념이 약하므로 여기서 제외되지 않음
+        return True
+    return False
+
+
 def _runs_from_bool(flags, min_len):
     runs, start = [], None
     for i, v in enumerate(flags):
@@ -500,7 +586,7 @@ def _piece_ok_for_split(piece: Image.Image) -> bool:
 
 def split_touching_images(pil_img: Image.Image, target_w: int, target_h: int):
     """상세 이미지 한 장 안에 여러 사진이 위아래/좌우로 붙은 경우만 분리.
-    v5 핵심: 텍스트/상품 내부선 때문에 정상 1컷을 억지로 반으로 자르지 않습니다.
+    v6 핵심: 텍스트/상품 내부선 때문에 정상 1컷을 억지로 반으로 자르지 않습니다.
     """
     img = trim_edge_bands(pil_img).convert("RGB")
     arr = np.array(img)
@@ -604,7 +690,7 @@ def crop_to_single_subject(pil_img: Image.Image, target_w: int = DEFAULT_TARGET_
     w, h = img.size
     l, t, r, b = bbox
     bw, bh = r - l, b - t
-    # v5: 상/하 흰 여백을 줄이기 위해 기존보다 타이트한 패딩
+    # v6: 상/하 흰 여백을 줄이기 위해 기존보다 타이트한 패딩
     pad_x = max(4, int(bw * 0.035))
     pad_y = max(4, int(bh * 0.025))
     l = clamp(l - pad_x, 0, w - 1)
@@ -626,9 +712,11 @@ def crop_to_single_subject(pil_img: Image.Image, target_w: int = DEFAULT_TARGET_
         crop_h = bh
         crop_w = crop_h * target_aspect
 
-    # 너무 꽉 끼면 상품 디테일이 잘릴 수 있어 2~4%만 보정
-    crop_w *= 1.025
-    crop_h *= 1.025
+    # 상품 전체컷은 제작자가 다시 중앙 보정하지 않아도 되도록 여유를 더 둡니다.
+    full_subject = (bh / float(h) > 0.48) or (bw * bh / float(w * h) > 0.22)
+    margin = 1.12 if full_subject else 1.045
+    crop_w *= margin
+    crop_h *= margin
     crop_w = min(crop_w, w)
     crop_h = min(crop_h, h)
 
@@ -696,10 +784,13 @@ def process_image_any(pil_img: Image.Image, prefix: str, target_w: int, target_h
 
     for idx, piece in enumerate(pieces, start=1):
         piece = safe_remove_text_bands(trim_edge_bands(piece))
-        if skip_no_subject and not has_usable_subject(piece):
-            skipped.append((f"{prefix}_{idx:02d}", "피사체 없음/공지·사이즈표·텍스트 카드로 판단"))
+        if skip_no_subject and (not has_usable_subject(piece) or is_low_value_generated_piece(piece)):
+            skipped.append((f"{prefix}_{idx:02d}", "피사체 없음/공지·사이즈표·텍스트·빈배경·잘린조각으로 판단"))
             continue
         thumb = make_thumbnail(piece, target_w, target_h)
+        if skip_no_subject and is_low_value_generated_piece(thumb):
+            skipped.append((f"{prefix}_{idx:02d}", "최종 썸네일 품질 미달: 치우침/잘림/무의미 컷"))
+            continue
         outputs.append((f"{prefix}_{idx:02d}_{target_w}x{target_h}.jpg", thumb))
     return outputs, skipped
 
@@ -720,11 +811,11 @@ st.markdown(
     </style>
     <div class="misharp-title-wrap">
       <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
-      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V5</div>
+      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V6</div>
       <div class="misharp-caption">1장=1피사체 / 흰줄·여백 제거 / 피사체 중앙 배치 / 기본 450×633 + 사용자 지정 사이즈</div>
     </div>
     <div class="rule-box">
-      절대원칙: 썸네일 1개에는 피사체 1개만 남깁니다. 두 장이 붙어 있는 상세컷은 경계선을 찾아 분리하고, 피사체 없는 안내/텍스트/사이즈표는 자동 제외하고, 원단·행거·디테일컷은 썸네일 소재로 포함합니다.
+      절대원칙: 썸네일 1개에는 피사체 1개만 남깁니다. 상품 전체컷은 중앙 정렬을 우선하고, 잘린 조각/브랜드스토리/공지/텍스트/빈 이미지/모바일 UI 캡처는 제외합니다. 원단·행거·디테일컷은 상품 피사체가 명확할 때만 포함합니다.
     </div>
     """,
     unsafe_allow_html=True,
