@@ -721,11 +721,7 @@ st.markdown(
     <div class="misharp-title-wrap">
       <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
       <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V5</div>
-      <div class="misharp-caption">1장=1피사체 / 흰줄·여백 제거 / 피사체 중앙 배치 / 기본 450×633 + 사용자 지정 사이즈</div>
-    </div>
-    <div class="rule-box">
-      절대원칙: 썸네일 1개에는 피사체 1개만 남깁니다. 두 장이 붙어 있는 상세컷은 경계선을 찾아 분리하고, 피사체 없는 안내/텍스트/사이즈표는 자동 제외하고, 원단·행거·디테일컷은 썸네일 소재로 포함합니다.
-    </div>
+          </div>
     """,
     unsafe_allow_html=True,
 )
@@ -748,8 +744,7 @@ with st.expander("생성 옵션", expanded=True):
             target_w, target_h = 1200, 800
     max_images = st.slider("상세영역에서 수집할 최대 이미지 수", 50, 600, 250, step=50)
     skip_no_subject = st.checkbox("피사체 없는 이미지 자동 제외", value=True)
-    st.caption("비율 왜곡 없이 Cover 방식으로 채우며, 최종 가장자리 1~3px는 안쪽 픽셀로 덮어 흰줄을 제거합니다.")
-
+   
 all_outputs = []
 skipped_all = []
 
