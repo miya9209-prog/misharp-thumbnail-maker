@@ -299,109 +299,113 @@ def split_touching_images(pil_img: Image.Image, target_w: int, target_h: int):
     return pieces if pieces else [img]
 
 # =========================
-# Thumbnail generation
+# Thumbnail generation  (V6 완전 재설계)
 # =========================
-def subject_center(pil_img: Image.Image):
-    """
-    피사체 중심 계산.
-    [V5 수정] 보정 기준 강화:
-      - 피사체가 세로 60% 이상 → 상단 보정 적용 (기존 75%)
-      - 보정 지점 bbox 35% (기존 40%) → 머리가 더 잘 보임
-      - 피사체가 이미지 하단에 치우쳐 있을 때 (center > 0.60) 추가 보정
-    """
-    bbox = subject_bbox(pil_img)
-    w, h = pil_img.size
-    if bbox is None:
-        return (w / 2.0, h / 2.0)
-    l, t, r, b = bbox
-    cx = (l + r) / 2.0
-    bh = b - t
-    bh_ratio = bh / float(h)
-    bbox_center = (t + b) / 2.0 / h  # 피사체 중심의 이미지 내 위치 (0~1)
-
-    if bh_ratio >= 0.60:
-        # 전신샷: 상단 35% 지점을 중심으로 → 머리/얼굴 우선
-        cy = t + bh * 0.35
-    elif bbox_center > 0.60:
-        # 피사체가 하단 치우침: 보정 없이 두면 하단 잘림 → 위로 당김
-        cy = t + bh * 0.40
-    else:
-        cy = (t + b) / 2.0
-    return (cx, cy)
-
-def resize_cover_then_crop(pil_img: Image.Image, target_w: int, target_h: int, center_xy=None):
-    """
-    Cover 방식 리사이즈 후 center_xy 기준으로 크롭.
-    [V5 수정] 세로 fit 전환 기준 완화: src_ratio > tgt_ratio * 1.05
-      기존 1.15 기준에서 누락되던 케이스(약간만 세로로 긴 전신샷)도 포함.
-    """
-    img = pil_img.convert("RGB")
-    W, H = img.size
-
-    src_ratio = H / max(W, 1)
-    tgt_ratio = target_h / max(target_w, 1)
-
-    if src_ratio > tgt_ratio * 1.05:
-        # 세로 fit: 가로를 target에 맞추고 세로 크롭 최소화
-        scale = target_w / W
-    else:
-        scale = max(target_w / W, target_h / H)
-
-    new_w, new_h = int(round(W * scale)), int(round(H * scale))
-    resized = img.resize((new_w, new_h), Image.LANCZOS)
-
-    if center_xy is None:
-        cx, cy = new_w / 2.0, new_h / 2.0
-    else:
-        ox, oy = center_xy
-        cx, cy = ox * scale, oy * scale
-
-    left = int(round(cx - target_w / 2.0))
-    top  = int(round(cy - target_h / 2.0))
-    left = clamp(left, 0, max(0, new_w - target_w))
-    top  = clamp(top,  0, max(0, new_h - target_h))
-
-    if new_h < target_h:
-        return resized.crop((left, 0, left + target_w, new_h)).resize(
-            (target_w, target_h), Image.LANCZOS
-        )
-
-    return resized.crop((left, top, left + target_w, top + target_h))
 
 def edge_bleed_fix(pil_img: Image.Image, n: int = 3):
+    """가장자리 1~3px를 안쪽 픽셀로 덮어 흰줄 제거."""
     img = pil_img.convert("RGB")
     arr = np.array(img).copy()
     h, w = arr.shape[:2]
     n = max(1, min(n, 5))
     if h <= 2 * n + 2 or w <= 2 * n + 2:
         return img
-    arr[0:n,:,:] = arr[n:n+1,:,:]
-    arr[h-n:h,:,:] = arr[h-n-1:h-n,:,:]
-    arr[:,0:n,:] = arr[:,n:n+1,:]
-    arr[:,w-n:w,:] = arr[:,w-n-1:w-n,:]
+    arr[0:n,:,:]      = arr[n:n+1,:,:]
+    arr[h-n:h,:,:]    = arr[h-n-1:h-n,:,:]
+    arr[:,0:n,:]      = arr[:,n:n+1,:]
+    arr[:,w-n:w,:]    = arr[:,w-n-1:w-n,:]
     return Image.fromarray(arr)
 
-def crop_to_single_subject(pil_img: Image.Image):
-    img = trim_edge_bands(pil_img).convert("RGB")
-    bbox = subject_bbox(img)
-    if bbox is None:
-        return img
-    w, h = img.size
-    l, t, r, b = bbox
-    bw, bh = r - l, b - t
-    pad_x = max(10, int(bw * 0.10))
-    pad_y = max(12, int(bh * 0.08))
-    l = clamp(l - pad_x, 0, w - 1)
-    r = clamp(r + pad_x, 1, w)
-    t = clamp(t - pad_y, 0, h - 1)
-    b = clamp(b + pad_y, 1, h)
-    return trim_edge_bands(img.crop((l, t, r, b)))
 
 def make_thumbnail(pil_img: Image.Image, target_w: int, target_h: int):
-    cut = crop_to_single_subject(pil_img)
-    cxy = subject_center(cut)
-    out = resize_cover_then_crop(cut, target_w, target_h, center_xy=cxy)
-    return edge_bleed_fix(out, n=3)
+    """
+    [V6 핵심 재설계] 피사체 bbox 기반 안전 크롭.
+
+    기존 문제:
+      crop_to_single_subject → 피사체만 남김 → 이미지 비율이 target과 유사해짐
+      → resize_cover가 세로를 잘라버림 → 상단/하단 잘림 발생
+
+    새 전략:
+      1. trim_edge_bands로 여백만 제거 (피사체 crop 없음)
+      2. subject_bbox로 피사체 위치 파악
+      3. 항상 가로를 target_w에 맞게 scale (좌우 여백 0 보장)
+      4. scale 후 피사체 bbox가 target_h 안에 들어오는지 확인
+         - 들어옴 → 피사체 상단 기준 crop (머리 우선)
+         - 안 들어옴(전신샷) → 피사체 상단 28% 기준 crop (얼굴 최대 확보)
+      5. 피사체 상단이 절대 잘리지 않도록 crop_top clamp
+    """
+    img = trim_edge_bands(pil_img).convert("RGB")
+    W, H = img.size
+
+    # 피사체 bbox 파악
+    bbox = subject_bbox(img)
+
+    if bbox is None:
+        # fallback: bbox 없으면 가로 기준 scale 후 상단 기준 crop
+        scale = target_w / W
+        new_w = int(round(W * scale))
+        new_h = int(round(H * scale))
+        resized = img.resize((new_w, new_h), Image.LANCZOS)
+        crop_top = 0
+        if new_h > target_h:
+            crop_top = max(0, new_h // 2 - target_h // 2)
+        crop_top = min(crop_top, max(0, new_h - target_h))
+        out = resized.crop((0, crop_top, target_w, min(new_h, crop_top + target_h)))
+        if out.size[1] < target_h:
+            out = out.resize((target_w, target_h), Image.LANCZOS)
+        return edge_bleed_fix(out)
+
+    bl, bt, br, bb = bbox
+    subj_w = br - bl
+    subj_h = bb - bt
+
+    # ── Step 1. 가로를 target_w에 맞게 scale ──────────────────────────
+    scale = target_w / W
+    new_w = int(round(W * scale))
+    new_h = int(round(H * scale))
+
+    # scale된 피사체 좌표
+    s_bl = bl * scale
+    s_bt = bt * scale
+    s_br = br * scale
+    s_bb = bb * scale
+    s_subj_h = subj_h * scale
+
+    # ── Step 2. crop_top 결정 ──────────────────────────────────────────
+    if s_subj_h <= target_h:
+        # 피사체가 target_h 안에 들어옴
+        # 피사체 상단 위로 여백을 두고 싶지만, 피사체가 잘리면 안 됨
+        # → 피사체 상단을 target 상단 10% 위치에 맞춤 (머리 위 약간 여백)
+        crop_top = s_bt - target_h * 0.08
+        crop_top = max(0.0, crop_top)
+        # 피사체 하단이 잘리지 않도록
+        if crop_top + target_h < s_bb:
+            crop_top = s_bb - target_h
+        crop_top = max(0.0, crop_top)
+    else:
+        # 피사체가 target_h보다 긺 → 얼굴/상단 최대 확보
+        # 피사체 상단에서 아래로 28% 지점을 화면 상단 20% 위치에
+        face_y   = s_bt + s_subj_h * 0.28
+        crop_top = face_y - target_h * 0.20
+        crop_top = max(0.0, crop_top)
+        # 피사체 상단이 화면 밖으로 나가지 않게 (머리 잘림 방지)
+        if crop_top > s_bt:
+            crop_top = max(0.0, s_bt - 5)
+
+    crop_top = int(round(min(crop_top, max(0, new_h - target_h))))
+
+    # ── Step 3. 리사이즈 후 크롭 ──────────────────────────────────────
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    crop_bot = crop_top + target_h
+
+    if crop_bot > new_h:
+        # 이미지가 target_h보다 짧으면 전체를 target 크기로 늘림
+        crop_region = resized.crop((0, crop_top, target_w, new_h))
+        out = crop_region.resize((target_w, target_h), Image.LANCZOS)
+    else:
+        out = resized.crop((0, crop_top, target_w, crop_bot))
+
+    return edge_bleed_fix(out)
 
 # =========================
 # URL extraction
@@ -526,7 +530,7 @@ st.markdown("""
 </style>
 <div class="misharp-title-wrap">
   <div class="misharp-title">MISHARP 썸네일 생성기</div>
-  <div class="misharp-sub">MISHARP Thumbnail Generator · misharpcompany</div>
+  <div class="misharp-sub">MISHARP Thumbnail Generator V6 · misharpcompany</div>
 </div>
 """, unsafe_allow_html=True)
 
