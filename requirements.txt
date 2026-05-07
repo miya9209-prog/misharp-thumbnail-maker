@@ -1,7 +1,0 @@
-streamlit
-pillow
-numpy
-requests
-beautifulsoup4
-lxml
-opencv-python-headless
