@@ -160,74 +160,100 @@ def subject_bbox(pil_img: Image.Image):
     return (left, top, right, bottom)
 
 
-def has_usable_subject(pil_img: Image.Image) -> bool:
-    """본문 설명/혜택/로고/원단 확대/텍스트 이미지 등 썸네일 부적합 이미지를 제외."""
+def is_text_or_notice_image(pil_img: Image.Image) -> bool:
+    """상품/모델 없이 설명문·사이즈표·혜택·공지 위주인 이미지를 제외합니다.
+    원단 확대컷과 행거/디테일컷은 제외하지 않도록 텍스트 패턴이 압도적인 경우만 True.
+    """
     img = pil_img.convert("RGB")
     w, h = img.size
-    if w < 180 or h < 180:
+    if w < 120 or h < 120:
+        return True
+    arr = np.array(img).astype(np.int16)
+    lum = arr.mean(axis=2)
+    sat = arr.max(axis=2) - arr.min(axis=2)
+    white_ratio = ((arr[:, :, 0] > 242) & (arr[:, :, 1] > 242) & (arr[:, :, 2] > 242)).mean()
+    light_plain = ((lum > 224) & (sat < 24)).mean()
+    gray = lum.astype(np.float32)
+    edge_density = ((np.abs(np.diff(gray, axis=1)) > 20).mean() + (np.abs(np.diff(gray, axis=0)) > 20).mean()) / 2
+    dark_ink = (lum < 115).mean()
+    if light_plain > 0.78 and dark_ink > 0.006 and edge_density > 0.010:
+        return True
+    if white_ratio > 0.86 and edge_density > 0.012:
+        return True
+    sat_mean = (arr.max(axis=2) - arr.min(axis=2)).mean()
+    if sat_mean < 4.0 and light_plain > 0.64 and edge_density > 0.018:
+        return True
+    return False
+
+
+def has_usable_subject(pil_img: Image.Image) -> bool:
+    """썸네일 소재 판단.
+    v4 기준: 모델컷뿐 아니라 행거컷, 원단컷, 허리/밑단/봉제 디테일컷도 허용합니다.
+    제외 대상은 피사체 없는 공지/사이즈표/텍스트 카드/빈 배경입니다.
+    """
+    img = remove_text_bands(trim_edge_bands(pil_img)).convert("RGB")
+    w, h = img.size
+    if w < 160 or h < 160:
         return False
+    if is_text_or_notice_image(img):
+        return False
+
     arr = np.array(img)
     bbox = subject_bbox(img)
+    gray = arr.mean(axis=2).astype(np.float32)
+    edge_density = ((np.abs(np.diff(gray, axis=1)) > 18).mean() + (np.abs(np.diff(gray, axis=0)) > 18).mean()) / 2
+    sat_mean = (arr.max(axis=2) - arr.min(axis=2)).mean()
+    white_ratio = ((arr[:, :, 0] > 242) & (arr[:, :, 1] > 242) & (arr[:, :, 2] > 242)).mean()
+    texture_or_product = (edge_density > 0.006 and white_ratio < 0.82) or (sat_mean > 3.0 and white_ratio < 0.88)
+
     if bbox is None:
-        return False
+        return bool(texture_or_product and min(w, h) >= 180)
+
     l, t, r, b = bbox
     bw, bh = r - l, b - t
     bbox_ratio = (bw * bh) / float(w * h)
     height_ratio = bh / float(h)
     width_ratio = bw / float(w)
 
-    white_ratio = ((arr[:, :, 0] > 242) & (arr[:, :, 1] > 242) & (arr[:, :, 2] > 242)).mean()
-    gray = arr.mean(axis=2).astype(np.float32)
-    edge_density = ((np.abs(np.diff(gray, axis=1)) > 22).mean() + (np.abs(np.diff(gray, axis=0)) > 22).mean()) / 2
-    sat_mean = (arr.max(axis=2) - arr.min(axis=2)).mean()
+    if height_ratio < 0.18 or width_ratio < 0.08 or bbox_ratio < 0.030:
+        return bool(texture_or_product and bbox_ratio > 0.018)
 
-    # 흑백/회색 위주의 안내·혜택·브랜드스토리·텍스트 카드 차단.
-    # 실제 상품/모델 컷은 흰 셔츠라도 피부·배경·그림자 때문에 평균 채도가 이보다 높게 나옵니다.
-    if sat_mean < 1.3 and edge_density > 0.007:
-        return False
-
-    # 텍스트/혜택/브랜드스토리 컷은 대부분 흰 바탕 + 작은 조각들이고, 유효 피사체 비율이 작습니다.
-    if height_ratio < 0.24 or width_ratio < 0.10 or bbox_ratio < 0.045:
-        return False
-    if white_ratio > 0.70 and bbox_ratio < 0.22 and edge_density > 0.022:
-        return False
-    if white_ratio > 0.82 and height_ratio < 0.62:
-        return False
-
-    # 중앙 피사체 없이 문구가 넓게 퍼진 컷 차단
     crop = arr[t:b, l:r]
     if crop.size == 0:
         return False
     crop_white = ((crop[:, :, 0] > 242) & (crop[:, :, 1] > 242) & (crop[:, :, 2] > 242)).mean()
-    if crop_white > 0.78 and bbox_ratio < 0.35:
-        return False
-
-    # 원단/디테일 확대는 썸네일 대표컷에서 제외. 옷걸이 단품은 중앙 여백이 있어 통과합니다.
-    if bbox_ratio > 0.90 and edge_density > 0.035:
+    if crop_white > 0.86 and bbox_ratio < 0.30:
         return False
     return True
-
 
 # =========================
 # Trimming / splitting
 # =========================
 def trim_edge_bands(pil_img: Image.Image, white_thr: int = 246, black_thr: int = 9):
-    """가장자리의 큰 흰/검정 띠를 벡터 방식으로 빠르게 제거."""
+    """가장자리 흰/검정/연회색 여백을 제거합니다.
+    기존 버전보다 상하 흰 여백을 더 강하게 제거해 최종 썸네일 상단/하단 흰줄을 방지합니다.
+    """
     img = pil_img.convert("RGB")
     arr = np.array(img).astype(np.int16)
     h, w = arr.shape[:2]
-    solid_ratio_thr = 0.985
-    std_thr = 10.0
+    if h < 20 or w < 20:
+        return img
 
+    lum = arr.mean(axis=2)
+    sat = arr.max(axis=2) - arr.min(axis=2)
+
+    # 순백/검정 띠 + 연회색 저질감 배경 띠를 같이 제거
     row_white = (arr > white_thr).all(axis=2).mean(axis=1)
     row_black = (arr < black_thr).all(axis=2).mean(axis=1)
+    row_light_plain = ((lum > 232) & (sat < 18)).mean(axis=1)
     row_std = arr.std(axis=1).mean(axis=1)
-    row_band = ((row_white >= solid_ratio_thr) | (row_black >= solid_ratio_thr)) & (row_std <= std_thr)
+    row_band = ((row_white >= 0.955) | (row_black >= 0.985) | (row_light_plain >= 0.965)) & (row_std <= 18.0)
 
     col_white = (arr > white_thr).all(axis=2).mean(axis=0)
     col_black = (arr < black_thr).all(axis=2).mean(axis=0)
+    col_light_plain = ((lum > 232) & (sat < 18)).mean(axis=0)
     col_std = arr.std(axis=0).mean(axis=1)
-    col_band = ((col_white >= solid_ratio_thr) | (col_black >= solid_ratio_thr)) & (col_std <= std_thr)
+    col_band = ((col_white >= 0.955) | (col_black >= 0.985) | (col_light_plain >= 0.965)) & (col_std <= 18.0)
 
     top = 0
     while top < h - 1 and row_band[top]:
@@ -242,9 +268,59 @@ def trim_edge_bands(pil_img: Image.Image, white_thr: int = 246, black_thr: int =
     while right > left and col_band[right]:
         right -= 1
 
-    if (right - left + 1) < max(160, w * 0.35) or (bottom - top + 1) < max(160, h * 0.35):
+    if (right - left + 1) < max(120, w * 0.30) or (bottom - top + 1) < max(120, h * 0.30):
         return img
     return img.crop((left, top, right + 1, bottom + 1))
+
+
+def remove_text_bands(pil_img: Image.Image):
+    """상세페이지 이미지 안에 포함된 설명 텍스트 영역을 잘라냅니다.
+    OCR 없이 흰/연회색 배경 + 작은 검정 글자 패턴을 상/하단에서 감지합니다.
+    원단/상품 디테일 자체는 유지하고, 글자 블록만 제거하는 보수적 컷입니다.
+    """
+    img = trim_edge_bands(pil_img).convert("RGB")
+    arr = np.array(img).astype(np.int16)
+    h, w = arr.shape[:2]
+    if h < 160 or w < 120:
+        return img
+
+    lum = arr.mean(axis=2)
+    sat = arr.max(axis=2) - arr.min(axis=2)
+    gray = lum.astype(np.float32)
+    edge_row = np.zeros(h, dtype=np.float32)
+    if w > 2:
+        edge_row = (np.abs(np.diff(gray, axis=1)) > 18).mean(axis=1)
+    light_plain = ((lum > 222) & (sat < 24)).mean(axis=1)
+    dark_ink = (lum < 120).mean(axis=1)
+
+    # 텍스트 행: 밝고 평평한 바탕에 검정 글자/획이 있는 행
+    text_like = (light_plain > 0.72) & ((dark_ink > 0.004) | (edge_row > 0.020))
+    plain_light = light_plain > 0.90
+
+    # 상단 텍스트/공지 블록 제거
+    top_cut = 0
+    scan_top = min(h, max(120, int(h * 0.45)))
+    for i in range(scan_top):
+        # 텍스트 또는 텍스트 주변 흰 여백이면 계속 넘김
+        if text_like[i] or (plain_light[i] and i < scan_top - 1 and text_like[max(0, i-2):min(h, i+8)].any()):
+            top_cut = i + 1
+        elif top_cut > 0 and i - top_cut > 18:
+            break
+
+    # 하단 텍스트/공지 블록 제거
+    bottom_cut = h
+    scan_bottom = max(0, h - max(120, int(h * 0.45)))
+    for i in range(h - 1, scan_bottom - 1, -1):
+        if text_like[i] or (plain_light[i] and text_like[max(0, i-8):min(h, i+3)].any()):
+            bottom_cut = i
+        elif bottom_cut < h and bottom_cut - i > 18:
+            break
+
+    # 너무 많이 자르면 원본 유지
+    if bottom_cut - top_cut < max(120, int(h * 0.35)):
+        return img
+    out = img.crop((0, top_cut, w, bottom_cut))
+    return trim_edge_bands(out)
 
 def _runs_from_bool(flags, min_len):
     runs, start = [], None
@@ -316,8 +392,8 @@ def split_touching_images(pil_img: Image.Image, target_w: int, target_h: int):
     img = trim_edge_bands(pil_img)
     arr = np.array(img.convert("RGB"))
     h, w = arr.shape[:2]
-    min_h = max(220, int(target_h * 0.55))
-    min_w = max(180, int(target_w * 0.50))
+    min_h = max(120, int(target_h * 0.28))
+    min_w = max(120, int(target_w * 0.38))
 
     hcuts = _solid_gap_cuts(arr, axis=0, min_gap=max(8, h // 140)) + _seam_cuts(arr, axis=0, min_piece=min_h)
     vcuts = _solid_gap_cuts(arr, axis=1, min_gap=max(8, w // 140)) + _seam_cuts(arr, axis=1, min_piece=min_w)
@@ -389,28 +465,59 @@ def edge_bleed_fix(pil_img: Image.Image, n: int = 3):
     return Image.fromarray(arr)
 
 
-def crop_to_single_subject(pil_img: Image.Image):
-    """텍스트/혜택 영역은 버리고, 썸네일로 쓸 1개 피사체 주변만 남깁니다."""
-    img = trim_edge_bands(pil_img).convert("RGB")
+def crop_to_single_subject(pil_img: Image.Image, target_w: int = DEFAULT_TARGET_W, target_h: int = DEFAULT_TARGET_H):
+    """텍스트/혜택 영역은 버리고, 1개 피사체를 목표 비율에 맞게 최대한 크게 남깁니다.
+    상단/하단 흰 여백이 남지 않도록 bbox 주변을 타이트하게 잡고 목표 비율로 재구성합니다.
+    """
+    img = remove_text_bands(trim_edge_bands(pil_img)).convert("RGB")
     bbox = subject_bbox(img)
     if bbox is None:
-        return img
+        return trim_edge_bands(img)
+
     w, h = img.size
     l, t, r, b = bbox
     bw, bh = r - l, b - t
-    # 피사체 주변 여백은 살리되, 상단/하단 설명 텍스트가 같이 들어오지 않도록 과한 여백은 제한합니다.
-    pad_x = max(10, int(bw * 0.10))
-    pad_y = max(12, int(bh * 0.08))
+    # v4: 상/하 흰 여백을 줄이기 위해 기존보다 타이트한 패딩
+    pad_x = max(4, int(bw * 0.035))
+    pad_y = max(4, int(bh * 0.025))
     l = clamp(l - pad_x, 0, w - 1)
     r = clamp(r + pad_x, 1, w)
     t = clamp(t - pad_y, 0, h - 1)
     b = clamp(b + pad_y, 1, h)
-    cropped = img.crop((l, t, r, b))
+
+    bw, bh = r - l, b - t
+    target_aspect = float(target_w) / float(target_h)
+    box_aspect = bw / max(bh, 1)
+    cx = (l + r) / 2.0
+    cy = (t + b) / 2.0
+
+    # 목표 비율을 만족하는 최소 crop box를 만든 뒤, 피사체가 중앙에 오도록 이동
+    if box_aspect > target_aspect:
+        crop_w = bw
+        crop_h = crop_w / target_aspect
+    else:
+        crop_h = bh
+        crop_w = crop_h * target_aspect
+
+    # 너무 꽉 끼면 상품 디테일이 잘릴 수 있어 2~4%만 보정
+    crop_w *= 1.025
+    crop_h *= 1.025
+    crop_w = min(crop_w, w)
+    crop_h = min(crop_h, h)
+
+    left = int(round(cx - crop_w / 2.0))
+    top = int(round(cy - crop_h / 2.0))
+    left = clamp(left, 0, max(0, w - int(round(crop_w))))
+    top = clamp(top, 0, max(0, h - int(round(crop_h))))
+    right = clamp(left + int(round(crop_w)), 1, w)
+    bottom = clamp(top + int(round(crop_h)), 1, h)
+
+    cropped = img.crop((left, top, right, bottom))
     return trim_edge_bands(cropped)
 
 
 def make_thumbnail(pil_img: Image.Image, target_w: int, target_h: int):
-    cut = crop_to_single_subject(pil_img)
+    cut = crop_to_single_subject(pil_img, target_w, target_h)
     cxy = subject_center(cut)
     out = resize_cover_then_crop(cut, target_w, target_h, center_xy=cxy)
     return edge_bleed_fix(out, n=3)
@@ -461,9 +568,9 @@ def process_image_any(pil_img: Image.Image, prefix: str, target_w: int, target_h
     pieces = split_touching_images(pil_img, target_w, target_h)
 
     for idx, piece in enumerate(pieces, start=1):
-        piece = trim_edge_bands(piece)
+        piece = remove_text_bands(trim_edge_bands(piece))
         if skip_no_subject and not has_usable_subject(piece):
-            skipped.append((f"{prefix}_{idx:02d}", "피사체 없음/텍스트·원단·디테일 컷으로 판단"))
+            skipped.append((f"{prefix}_{idx:02d}", "피사체 없음/공지·사이즈표·텍스트 카드로 판단"))
             continue
         thumb = make_thumbnail(piece, target_w, target_h)
         outputs.append((f"{prefix}_{idx:02d}_{target_w}x{target_h}.jpg", thumb))
@@ -486,11 +593,11 @@ st.markdown(
     </style>
     <div class="misharp-title-wrap">
       <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
-      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V2</div>
+      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V4</div>
       <div class="misharp-caption">1장=1피사체 / 흰줄·여백 제거 / 피사체 중앙 배치 / 기본 450×633 + 사용자 지정 사이즈</div>
     </div>
     <div class="rule-box">
-      절대원칙: 썸네일 1개에는 피사체 1개만 남깁니다. 두 장이 붙어 있는 상세컷은 경계선을 찾아 분리하고, 피사체 없는 안내/텍스트/원단 확대 컷은 자동 제외합니다.
+      절대원칙: 썸네일 1개에는 피사체 1개만 남깁니다. 두 장이 붙어 있는 상세컷은 경계선을 찾아 분리하고, 피사체 없는 안내/텍스트/사이즈표는 자동 제외하고, 원단·행거·디테일컷은 썸네일 소재로 포함합니다.
     </div>
     """,
     unsafe_allow_html=True,
