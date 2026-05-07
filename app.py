@@ -221,41 +221,19 @@ def _solid_gap_cuts(arr, axis: int, min_gap: int):
     return [int((s + e) / 2) for s, e in _runs_from_bool(flags, min_gap)]
 
 def _seam_cuts(arr, axis: int, min_piece: int):
-    """
-    [V3 수정] gray + 채도(sat) 결합 점수로 경계 탐지.
-    세로가 긴 이미지(2장 붙음 의심)일 때 임계값 완화.
-    """
-    h, w = arr.shape[:2]
+    """붙어있는 2장 이상 사진의 경계선 탐지. 흰 여백이 없어도 색/명암 급변 라인을 잡습니다."""
     gray = arr.mean(axis=2).astype(np.float32)
-    sat_arr = arr.astype(np.float32)
-    sat = sat_arr.max(axis=2) - sat_arr.min(axis=2)
-
     if axis == 0:
-        score_gray = np.abs(np.diff(gray, axis=0)).mean(axis=1)
-        score_sat  = np.abs(np.diff(sat,  axis=0)).mean(axis=1)
-        length = h
-        aspect_ratio = h / max(w, 1)
+        score = np.abs(np.diff(gray, axis=0)).mean(axis=1)
+        length = arr.shape[0]
     else:
-        score_gray = np.abs(np.diff(gray, axis=1)).mean(axis=0)
-        score_sat  = np.abs(np.diff(sat,  axis=1)).mean(axis=0)
-        length = w
-        aspect_ratio = w / max(h, 1)
-
-    score = score_gray * 0.65 + score_sat * 0.35
-
+        score = np.abs(np.diff(gray, axis=1)).mean(axis=0)
+        length = arr.shape[1]
     if len(score) < min_piece * 2:
         return []
-
     med = float(np.median(score))
-    p95 = float(np.percentile(score, 95))
     p98 = float(np.percentile(score, 98))
-
-    # [핵심수정] 세로 긴 이미지 → 임계값 낮춤 (기존 하한 10.0 → 5.0)
-    if aspect_ratio > 1.8:
-        thr = max(med * 3.0, p95 * 1.10, 5.0)
-    else:
-        thr = max(med * 3.5, p98 * 1.15, 7.0)
-
+    thr = max(med * 4.0, p98 * 1.18, 10.0)
     candidates = np.where(score >= thr)[0] + 1
     cuts = []
     for c in candidates:
@@ -272,68 +250,16 @@ def _seam_cuts(arr, axis: int, min_piece: int):
         cuts = sorted(cuts)
     return cuts
 
-def _detect_double_image_by_structure(arr, axis: int, min_piece: int) -> list:
-    """
-    [V3 신규] 색상 변화 없이 붙어있는 2장 이미지를 구조로 감지.
-    상단 절반 / 하단 절반 각각의 피사체 무게중심이 독립적이면 분리.
-    """
-    h, w = arr.shape[:2]
-    if axis != 0:
-        return []
-    half = h // 2
-    if half < min_piece:
-        return []
-    gray = arr.mean(axis=2).astype(np.float32)
-
-    def _mass_center(region):
-        row_mean = region.mean(axis=1)
-        bg_lum = float(np.percentile(row_mean, 80))
-        weights = np.maximum(0, bg_lum - row_mean)
-        total = weights.sum()
-        if total < 1:
-            return None
-        return float((weights * np.arange(len(row_mean))).sum() / total)
-
-    top_c = _mass_center(gray[:half])
-    bot_c = _mass_center(gray[half:])
-
-    if top_c is None or bot_c is None:
-        return []
-
-    top_ratio = top_c / half
-    bot_ratio = bot_c / (h - half)
-
-    if 0.15 < top_ratio < 0.85 and 0.15 < bot_ratio < 0.85:
-        mid_band = gray[half - 20 : half + 20] if half >= 20 else gray
-        mid_brightness = mid_band.mean()
-        overall_bright = float(np.percentile(gray, 85))
-        if mid_brightness > overall_bright * 0.92:
-            return [half]
-    return []
-
 def split_touching_images(pil_img: Image.Image, target_w: int, target_h: int):
-    """
-    [V3 수정]
-    1. min_piece 완화: 0.55 → 0.42
-    2. _detect_double_image_by_structure 추가
-    3. hcuts 분리 후 vcuts도 적용 가능 (elif 제거)
-    """
+    """상세 이미지 한 장 안에 여러 사진이 위아래/좌우로 붙은 경우 분리."""
     img = trim_edge_bands(pil_img)
     arr = np.array(img.convert("RGB"))
     h, w = arr.shape[:2]
-    min_h = max(180, int(target_h * 0.42))
-    min_w = max(160, int(target_w * 0.42))
+    min_h = max(220, int(target_h * 0.55))
+    min_w = max(180, int(target_w * 0.50))
 
-    hcuts = (
-        _solid_gap_cuts(arr, axis=0, min_gap=max(6, h // 150))
-        + _seam_cuts(arr, axis=0, min_piece=min_h)
-        + _detect_double_image_by_structure(arr, axis=0, min_piece=min_h)
-    )
-    vcuts = (
-        _solid_gap_cuts(arr, axis=1, min_gap=max(6, w // 150))
-        + _seam_cuts(arr, axis=1, min_piece=min_w)
-    )
-
+    hcuts = _solid_gap_cuts(arr, axis=0, min_gap=max(8, h // 140)) + _seam_cuts(arr, axis=0, min_piece=min_h)
+    vcuts = _solid_gap_cuts(arr, axis=1, min_gap=max(8, w // 140)) + _seam_cuts(arr, axis=1, min_piece=min_w)
     hcuts = sorted(set([c for c in hcuts if min_h <= c <= h - min_h]))
     vcuts = sorted(set([c for c in vcuts if min_w <= c <= w - min_w]))
 
@@ -342,18 +268,7 @@ def split_touching_images(pil_img: Image.Image, target_w: int, target_h: int):
         bounds = [0] + hcuts + [h]
         for y1, y2 in zip(bounds[:-1], bounds[1:]):
             if y2 - y1 >= min_h:
-                piece = img.crop((0, y1, w, y2))
-                if vcuts:
-                    sub_vcuts = sorted(set([c for c in vcuts if min_w <= c <= w - min_w]))
-                    if sub_vcuts:
-                        bounds_v = [0] + sub_vcuts + [w]
-                        for x1, x2 in zip(bounds_v[:-1], bounds_v[1:]):
-                            if x2 - x1 >= min_w:
-                                pieces.append(piece.crop((x1, 0, x2, y2 - y1)))
-                    else:
-                        pieces.append(piece)
-                else:
-                    pieces.append(piece)
+                pieces.append(img.crop((0, y1, w, y2)))
     elif vcuts:
         bounds = [0] + vcuts + [w]
         for x1, x2 in zip(bounds[:-1], bounds[1:]):
@@ -368,28 +283,66 @@ def split_touching_images(pil_img: Image.Image, target_w: int, target_h: int):
 # Thumbnail generation
 # =========================
 def subject_center(pil_img: Image.Image):
+    """
+    피사체 중심 계산.
+    전신샷처럼 피사체가 세로를 꽉 채울 때 단순 bbox 중심 대신
+    상단을 조금 더 보여주는 방향으로 보정 (머리가 잘리는 현상 방지).
+    """
     bbox = subject_bbox(pil_img)
     w, h = pil_img.size
     if bbox is None:
         return (w / 2.0, h / 2.0)
     l, t, r, b = bbox
-    return ((l + r) / 2.0, (t + b) / 2.0)
+    cx = (l + r) / 2.0
+    bh = b - t
+    # 피사체가 세로의 75% 이상이면 전신샷으로 간주
+    # → 중심을 bbox 중앙이 아닌 위쪽 40% 지점으로 올려서 머리가 잘리지 않게 함
+    if bh / float(h) >= 0.75:
+        cy = t + bh * 0.40
+    else:
+        cy = (t + b) / 2.0
+    return (cx, cy)
 
 def resize_cover_then_crop(pil_img: Image.Image, target_w: int, target_h: int, center_xy=None):
+    """
+    Cover 방식 리사이즈 후 center_xy 기준으로 크롭.
+    피사체가 세로를 꽉 채운 전신샷은 가로만 맞추고 세로는 자르지 않는 fit 방식으로 전환.
+    """
     img = pil_img.convert("RGB")
     W, H = img.size
-    scale = max(target_w / W, target_h / H)
+
+    # 전신샷 판별: 이미지 비율이 target 비율보다 훨씬 세로가 길면 fit(세로 기준) 사용
+    src_ratio = H / max(W, 1)
+    tgt_ratio = target_h / max(target_w, 1)
+
+    if src_ratio > tgt_ratio * 1.15:
+        # 세로 fit: 가로를 target에 맞추고 세로는 비율대로 (크롭 최소화)
+        scale = target_w / W
+    else:
+        # 일반 cover: 짧은 쪽을 target에 맞춤
+        scale = max(target_w / W, target_h / H)
+
     new_w, new_h = int(round(W * scale)), int(round(H * scale))
     resized = img.resize((new_w, new_h), Image.LANCZOS)
+
     if center_xy is None:
         cx, cy = new_w / 2.0, new_h / 2.0
     else:
         ox, oy = center_xy
         cx, cy = ox * scale, oy * scale
+
     left = int(round(cx - target_w / 2.0))
-    top = int(round(cy - target_h / 2.0))
+    top  = int(round(cy - target_h / 2.0))
     left = clamp(left, 0, max(0, new_w - target_w))
-    top = clamp(top, 0, max(0, new_h - target_h))
+    top  = clamp(top,  0, max(0, new_h - target_h))
+
+    # new_h가 target_h보다 작으면 세로 중앙 배치 (여백 없이 붙임)
+    if new_h < target_h:
+        # 상하 여백 없이 가로만 맞춘 결과물 → 그대로 반환 (세로 패딩 없음)
+        return resized.crop((left, 0, left + target_w, new_h)).resize(
+            (target_w, target_h), Image.LANCZOS
+        )
+
     return resized.crop((left, top, left + target_w, top + target_h))
 
 def edge_bleed_fix(pil_img: Image.Image, n: int = 3):
@@ -517,7 +470,7 @@ st.markdown("""
 </style>
 <div class="misharp-title-wrap">
   <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
-  <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V3 — 2장 분리 강화 / 진행바 / 병렬처리</div>
+  <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V4 — 전신샷 크롭 개선 / 진행바 / 병렬처리</div>
   <div class="misharp-caption">1장=1피사체 / 흰줄·여백 제거 / 피사체 중앙 배치 / 기본 450×633</div>
 </div>
 <div class="rule-box">
