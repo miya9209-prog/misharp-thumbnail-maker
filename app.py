@@ -7,7 +7,7 @@ import numpy as np
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, ImageFilter
 
 # =========================
 # Default output size
@@ -188,7 +188,7 @@ def is_text_or_notice_image(pil_img: Image.Image) -> bool:
 
 def has_usable_subject(pil_img: Image.Image) -> bool:
     """썸네일 소재 판단.
-    v6 기준: 모델컷뿐 아니라 행거컷, 원단컷, 허리/밑단/봉제 디테일컷도 허용합니다.
+    v7 기준: 모델컷뿐 아니라 행거컷, 원단컷, 허리/밑단/봉제 디테일컷도 허용합니다.
     제외 대상은 피사체 없는 공지/사이즈표/텍스트 카드/빈 배경입니다.
     """
     img = trim_edge_bands(pil_img).convert("RGB")
@@ -586,7 +586,7 @@ def _piece_ok_for_split(piece: Image.Image) -> bool:
 
 def split_touching_images(pil_img: Image.Image, target_w: int, target_h: int):
     """상세 이미지 한 장 안에 여러 사진이 위아래/좌우로 붙은 경우만 분리.
-    v6 핵심: 텍스트/상품 내부선 때문에 정상 1컷을 억지로 반으로 자르지 않습니다.
+    v7 핵심: 텍스트/상품 내부선 때문에 정상 1컷을 억지로 반으로 자르지 않습니다.
     """
     img = trim_edge_bands(pil_img).convert("RGB")
     arr = np.array(img)
@@ -690,7 +690,7 @@ def crop_to_single_subject(pil_img: Image.Image, target_w: int = DEFAULT_TARGET_
     w, h = img.size
     l, t, r, b = bbox
     bw, bh = r - l, b - t
-    # v6: 상/하 흰 여백을 줄이기 위해 기존보다 타이트한 패딩
+    # v7: 디테일컷은 타이트하게, 전체 상품컷은 make_thumbnail preserve 모드에서 별도 처리
     pad_x = max(4, int(bw * 0.035))
     pad_y = max(4, int(bh * 0.025))
     l = clamp(l - pad_x, 0, w - 1)
@@ -731,7 +731,146 @@ def crop_to_single_subject(pil_img: Image.Image, target_w: int = DEFAULT_TARGET_
     return trim_edge_bands(cropped)
 
 
+def _bbox_metrics(pil_img: Image.Image):
+    img = trim_edge_bands(pil_img).convert("RGB")
+    w, h = img.size
+    bbox = subject_bbox(img)
+    if bbox is None:
+        return None
+    l, t, r, b = bbox
+    bw, bh = r - l, b - t
+    return {
+        "bbox": bbox,
+        "w": w,
+        "h": h,
+        "bw": bw,
+        "bh": bh,
+        "area_ratio": (bw * bh) / float(max(1, w * h)),
+        "height_ratio": bh / float(max(1, h)),
+        "width_ratio": bw / float(max(1, w)),
+        "cx_ratio": ((l + r) / 2.0) / float(max(1, w)),
+        "cy_ratio": ((t + b) / 2.0) / float(max(1, h)),
+    }
+
+
+def is_full_product_or_hanger_cut(pil_img: Image.Image) -> bool:
+    """행거컷/상품 전체컷 판정.
+    이런 컷은 '꽉 채우기'보다 '잘리지 않고 중앙 배치'가 우선입니다.
+    """
+    m = _bbox_metrics(pil_img)
+    if not m:
+        return False
+    # 세로로 긴 옷/모델/행거컷 또는 화면에서 상품 비중이 큰 전체컷
+    return (
+        (m["height_ratio"] >= 0.46 and m["width_ratio"] >= 0.28)
+        or (m["area_ratio"] >= 0.20 and m["height_ratio"] >= 0.36)
+        or (m["height_ratio"] >= 0.58)
+    )
+
+
+def crop_subject_preserve_aspect(pil_img: Image.Image, target_w: int, target_h: int):
+    """상품 전체컷용 안전 crop.
+    bbox에 충분한 좌우/상하 안전마진을 주고, 목표 비율을 맞추되 피사체가 절대 잘리지 않게 합니다.
+    """
+    img = trim_edge_bands(pil_img).convert("RGB")
+    w, h = img.size
+    bbox = subject_bbox(img)
+    if bbox is None:
+        return img
+    l, t, r, b = bbox
+    bw, bh = r - l, b - t
+
+    # 전체 상품컷은 소매/어깨가 bbox 밖으로 빠지는 경우가 많아 여백을 넉넉히 둡니다.
+    pad_x = max(16, int(bw * 0.16))
+    pad_top = max(12, int(bh * 0.10))
+    pad_bottom = max(12, int(bh * 0.08))
+    l = clamp(l - pad_x, 0, w - 1)
+    r = clamp(r + pad_x, 1, w)
+    t = clamp(t - pad_top, 0, h - 1)
+    b = clamp(b + pad_bottom, 1, h)
+
+    bw, bh = r - l, b - t
+    target_aspect = float(target_w) / float(target_h)
+    crop_w, crop_h = float(bw), float(bh)
+    if crop_w / max(1.0, crop_h) > target_aspect:
+        crop_h = crop_w / target_aspect
+    else:
+        crop_w = crop_h * target_aspect
+
+    # 너무 타이트하지 않게 한 번 더 확장. 단, 원본 범위는 넘지 않음.
+    crop_w = min(float(w), crop_w * 1.03)
+    crop_h = min(float(h), crop_h * 1.03)
+
+    cx = (l + r) / 2.0
+    cy = (t + b) / 2.0
+    left = int(round(cx - crop_w / 2.0))
+    top = int(round(cy - crop_h / 2.0))
+    left = clamp(left, 0, max(0, w - int(round(crop_w))))
+    top = clamp(top, 0, max(0, h - int(round(crop_h))))
+    right = clamp(left + int(round(crop_w)), 1, w)
+    bottom = clamp(top + int(round(crop_h)), 1, h)
+    return img.crop((left, top, right, bottom))
+
+
+def resize_contain_centered(pil_img: Image.Image, target_w: int, target_h: int):
+    """상품 전체를 보존하면서 450x633 캔버스 중앙에 배치합니다.
+    남는 영역은 원본을 cover/blur 처리한 배경으로 채워 흰 줄/빈 여백 느낌을 줄입니다.
+    """
+    img = pil_img.convert("RGB")
+    W, H = img.size
+    if W <= 0 or H <= 0:
+        return Image.new("RGB", (target_w, target_h), (255, 255, 255))
+
+    # 배경은 같은 이미지를 cover로 깔아 가장자리 흰줄과 과한 빈 여백을 줄임
+    bg = resize_cover_then_crop(img, target_w, target_h, center_xy=(W / 2.0, H / 2.0))
+    try:
+        bg = bg.filter(ImageFilter.GaussianBlur(radius=8))
+    except Exception:
+        pass
+
+    scale = min(target_w / float(W), target_h / float(H))
+    # 너무 작게 들어가면 썸네일 힘이 약해지므로, 피사체 보존 범위 안에서 약간 키움
+    scale = min(scale * 0.985, scale)
+    new_w, new_h = max(1, int(round(W * scale))), max(1, int(round(H * scale)))
+    fg = img.resize((new_w, new_h), Image.LANCZOS)
+
+    x = int(round((target_w - new_w) / 2.0))
+    y = int(round((target_h - new_h) / 2.0))
+    bg.paste(fg, (x, y))
+    return bg
+
+
+def is_cut_or_offcenter_thumb(pil_img: Image.Image) -> bool:
+    """최종 썸네일 검수: 상품 전체컷이 한쪽으로 치우치거나 잘린 경우 제외/재처리 판단."""
+    img = pil_img.convert("RGB")
+    w, h = img.size
+    bbox = subject_bbox(img)
+    if bbox is None:
+        return False
+    l, t, r, b = bbox
+    bw, bh = r - l, b - t
+    cx = (l + r) / 2.0 / float(w)
+    area_ratio = (bw * bh) / float(w * h)
+    # 큰 피사체인데 좌우 끝에 닿거나 중심이 많이 벗어나면 제작자가 다시 손봐야 하는 컷으로 판단
+    touches_lr = l <= int(w * 0.015) or r >= w - int(w * 0.015)
+    offcenter = cx < 0.43 or cx > 0.57
+    if area_ratio > 0.18 and (touches_lr or offcenter):
+        return True
+    return False
+
+
 def make_thumbnail(pil_img: Image.Image, target_w: int, target_h: int):
+    # 행거컷/상품 전체컷은 preserve 모드: 잘림 방지 + 중앙 배치가 최우선
+    if is_full_product_or_hanger_cut(pil_img):
+        cut = crop_subject_preserve_aspect(pil_img, target_w, target_h)
+        out = resize_contain_centered(cut, target_w, target_h)
+        # 혹시 contain 후에도 피사체가 너무 치우치면 bbox 기준 crop-preserve를 다시 시도
+        if is_cut_or_offcenter_thumb(out):
+            cut = crop_subject_preserve_aspect(cut, target_w, target_h)
+            out = resize_contain_centered(cut, target_w, target_h)
+        return edge_bleed_fix(out, n=3)
+
+    # 원단/디테일컷은 기존처럼 화면을 채우되 bbox 중심으로 리프레이밍
     cut = crop_to_single_subject(pil_img, target_w, target_h)
     cxy = subject_center(cut)
     out = resize_cover_then_crop(cut, target_w, target_h, center_xy=cxy)
@@ -811,11 +950,11 @@ st.markdown(
     </style>
     <div class="misharp-title-wrap">
       <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
-      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V6</div>
+      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V7</div>
       <div class="misharp-caption">1장=1피사체 / 흰줄·여백 제거 / 피사체 중앙 배치 / 기본 450×633 + 사용자 지정 사이즈</div>
     </div>
     <div class="rule-box">
-      절대원칙: 썸네일 1개에는 피사체 1개만 남깁니다. 상품 전체컷은 중앙 정렬을 우선하고, 잘린 조각/브랜드스토리/공지/텍스트/빈 이미지/모바일 UI 캡처는 제외합니다. 원단·행거·디테일컷은 상품 피사체가 명확할 때만 포함합니다.
+      절대원칙: 썸네일 1개에는 피사체 1개만 남깁니다. 상품 전체컷/행거컷은 잘림 없이 중앙 정렬을 우선하고, 잘린 조각/브랜드스토리/공지/텍스트/빈 이미지/모바일 UI 캡처는 제외합니다. 원단·행거·디테일컷은 상품 피사체가 명확할 때만 포함합니다.
     </div>
     """,
     unsafe_allow_html=True,
