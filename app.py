@@ -75,45 +75,55 @@ def subject_mask(arr: np.ndarray) -> np.ndarray:
     return mask
 
 
-def largest_component_bbox(mask: np.ndarray):
-    """Downscale mask에서 가장 큰 연결 성분 bbox를 찾습니다. scipy가 있으면 빠르게, 없으면 numpy 기반으로 동작."""
+def component_bboxes(mask: np.ndarray, min_area_ratio: float = 0.0012):
+    """피사체 후보 연결 성분 bbox 목록. 텍스트 조각은 대체로 작고 납작하므로 제외합니다."""
     h, w = mask.shape
-    scale = min(1.0, 160.0 / max(h, w))
-    if scale < 1.0:
-        im = Image.fromarray((mask.astype(np.uint8) * 255))
-        small = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.NEAREST)
-        m = np.array(small) > 0
-    else:
-        m = mask.copy()
-
-    sh, sw = m.shape
-
     try:
-        from scipy import ndimage as ndi  # Streamlit Cloud에 없을 경우 아래 fallback 사용
-        labels, num = ndi.label(m)
-        if num == 0:
-            return None
-        counts = np.bincount(labels.ravel())
-        counts[0] = 0
-        lab = int(counts.argmax())
-        ys, xs = np.where(labels == lab)
-        if len(xs) == 0:
-            return None
-        minx, maxx = int(xs.min()), int(xs.max())
-        miny, maxy = int(ys.min()), int(ys.max())
-        area = int(counts[lab])
+        import cv2
+        m = (mask.astype(np.uint8) * 255)
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        comps = []
+        area_min = max(40, int(h * w * min_area_ratio))
+        for lab in range(1, num):
+            x, y, bw, bh, area = stats[lab]
+            if area < area_min:
+                continue
+            comps.append((int(x), int(y), int(x + bw), int(y + bh), int(area)))
+        comps.sort(key=lambda x: x[4], reverse=True)
+        return comps
     except Exception:
-        # 빠른 fallback: 행/열 투영 bbox. 완전한 연결성은 아니지만 텍스트/피사체 필터에는 충분합니다.
-        rows = np.where(m.mean(axis=1) > 0.01)[0]
-        cols = np.where(m.mean(axis=0) > 0.01)[0]
-        if len(rows) == 0 or len(cols) == 0:
-            return None
-        minx, maxx = int(cols[0]), int(cols[-1])
-        miny, maxy = int(rows[0]), int(rows[-1])
-        area = int(m.sum())
+        comp = largest_component_bbox_fallback(mask)
+        return [comp] if comp else []
 
-    sx, sy = w / sw, h / sh
-    return (int(minx * sx), int(miny * sy), int((maxx + 1) * sx), int((maxy + 1) * sy), int(area / (sw * sh) * w * h))
+
+def largest_component_bbox_fallback(mask: np.ndarray):
+    h, w = mask.shape
+    rows = np.where(mask.mean(axis=1) > 0.01)[0]
+    cols = np.where(mask.mean(axis=0) > 0.01)[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return None
+    return (int(cols[0]), int(rows[0]), int(cols[-1]), int(rows[-1]), int(mask.sum()))
+
+
+def _valid_subject_component(comp, w: int, h: int) -> bool:
+    l, t, r, b, area = comp
+    bw, bh = r - l, b - t
+    if bw <= 0 or bh <= 0:
+        return False
+    area_ratio = area / float(w * h)
+    box_ratio = (bw * bh) / float(w * h)
+    hr = bh / float(h)
+    wr = bw / float(w)
+    aspect = bh / max(bw, 1)
+
+    # 텍스트 한 줄/작은 로고/아이콘은 제외. 모델·옷걸이 상품·착장 컷은 통과.
+    if area_ratio < 0.006 and box_ratio < 0.045:
+        return False
+    if hr < 0.20 or wr < 0.08:
+        return False
+    if aspect < 0.45 and hr < 0.42:
+        return False
+    return True
 
 
 def subject_bbox(pil_img: Image.Image):
@@ -121,41 +131,37 @@ def subject_bbox(pil_img: Image.Image):
     arr = np.array(img)
     h, w = arr.shape[:2]
     mask = subject_mask(arr)
+    comps = component_bboxes(mask)
+    valid = [c for c in comps if _valid_subject_component(c, w, h)]
 
-    comp = largest_component_bbox(mask)
-    rows = np.where(mask.mean(axis=1) > 0.006)[0]
-    cols = np.where(mask.mean(axis=0) > 0.006)[0]
-    if len(rows) == 0 or len(cols) == 0:
-        return None
-
-    # 연결 성분이 충분하면 그것을 우선 사용, 아니면 전체 mask bbox 사용
-    if comp is not None:
-        l, t, r, b, area = comp
-        comp_ratio = area / float(w * h)
-        comp_h_ratio = (b - t) / float(h)
-        comp_w_ratio = (r - l) / float(w)
-        if comp_ratio > 0.015 and comp_h_ratio > 0.14 and comp_w_ratio > 0.07:
-            left, top, right, bottom = l, t, r, b
-        else:
-            left, right = int(cols[0]), int(cols[-1])
-            top, bottom = int(rows[0]), int(rows[-1])
+    if valid:
+        # 가장 큰 피사체 1개만 사용합니다. 여러 모델/여러 상품이 같이 있으면 1개만 중심으로 잡습니다.
+        left, top, right, bottom, _ = valid[0]
     else:
+        # fallback도 너무 쉽게 쓰지 않습니다. 텍스트/안내컷 생성을 막는 쪽으로 보수적으로 처리합니다.
+        rows = np.where(mask.mean(axis=1) > 0.012)[0]
+        cols = np.where(mask.mean(axis=0) > 0.012)[0]
+        if len(rows) == 0 or len(cols) == 0:
+            return None
         left, right = int(cols[0]), int(cols[-1])
         top, bottom = int(rows[0]), int(rows[-1])
+        bw, bh = right - left + 1, bottom - top + 1
+        if bh / float(h) < 0.36 or bw / float(w) < 0.16 or (bw * bh) / float(w * h) < 0.08:
+            return None
 
-    pad_x = max(5, int((right - left + 1) * 0.04))
-    pad_y = max(6, int((bottom - top + 1) * 0.035))
+    pad_x = max(8, int((right - left + 1) * 0.075))
+    pad_y = max(8, int((bottom - top + 1) * 0.065))
     left = clamp(left - pad_x, 0, w - 1)
     right = clamp(right + pad_x, 1, w)
     top = clamp(top - pad_y, 0, h - 1)
     bottom = clamp(bottom + pad_y, 1, h)
-    if (right - left) < 30 or (bottom - top) < 40:
+    if (right - left) < 45 or (bottom - top) < 70:
         return None
     return (left, top, right, bottom)
 
 
 def has_usable_subject(pil_img: Image.Image) -> bool:
-    """본문 설명/원단 확대/텍스트 이미지 등 썸네일 부적합 이미지를 최대한 제외."""
+    """본문 설명/혜택/로고/원단 확대/텍스트 이미지 등 썸네일 부적합 이미지를 제외."""
     img = pil_img.convert("RGB")
     w, h = img.size
     if w < 180 or h < 180:
@@ -170,27 +176,34 @@ def has_usable_subject(pil_img: Image.Image) -> bool:
     height_ratio = bh / float(h)
     width_ratio = bw / float(w)
 
-    # 텍스트/배너 컷: 흰 배경이 과도하고 피사체 연결 성분이 작거나 납작하면 제외
     white_ratio = ((arr[:, :, 0] > 242) & (arr[:, :, 1] > 242) & (arr[:, :, 2] > 242)).mean()
     gray = arr.mean(axis=2).astype(np.float32)
-    gx = np.abs(np.diff(gray, axis=1)).mean()
-    gy = np.abs(np.diff(gray, axis=0)).mean()
     edge_density = ((np.abs(np.diff(gray, axis=1)) > 22).mean() + (np.abs(np.diff(gray, axis=0)) > 22).mean()) / 2
+    sat_mean = (arr.max(axis=2) - arr.min(axis=2)).mean()
 
-    if height_ratio < 0.22 or width_ratio < 0.10:
+    # 흑백/회색 위주의 안내·혜택·브랜드스토리·텍스트 카드 차단.
+    # 실제 상품/모델 컷은 흰 셔츠라도 피부·배경·그림자 때문에 평균 채도가 이보다 높게 나옵니다.
+    if sat_mean < 1.3 and edge_density > 0.007:
         return False
-    if bbox_ratio < 0.035:
+
+    # 텍스트/혜택/브랜드스토리 컷은 대부분 흰 바탕 + 작은 조각들이고, 유효 피사체 비율이 작습니다.
+    if height_ratio < 0.24 or width_ratio < 0.10 or bbox_ratio < 0.045:
         return False
-    if white_ratio > 0.72 and bbox_ratio < 0.30 and edge_density > 0.035:
+    if white_ratio > 0.70 and bbox_ratio < 0.22 and edge_density > 0.022:
         return False
-    # 안내/혜택/문구형 이미지는 가로 전체에 텍스트/그래픽이 퍼지고 세로 피사체가 부족합니다.
-    if width_ratio > 0.88 and height_ratio < 0.86 and white_ratio > 0.34:
+    if white_ratio > 0.82 and height_ratio < 0.62:
         return False
-    if white_ratio > 0.86 and height_ratio < 0.55:
+
+    # 중앙 피사체 없이 문구가 넓게 퍼진 컷 차단
+    crop = arr[t:b, l:r]
+    if crop.size == 0:
         return False
-    # 원단/디테일 확대는 피사체가 화면 전체를 채우는 경우가 많지만 썸네일로는 부적합
-    # 인물/상품 컷은 대개 배경 여백과 명확한 피사체 bbox가 함께 존재합니다.
-    if bbox_ratio > 0.92 and max(gx, gy) > 5.5:
+    crop_white = ((crop[:, :, 0] > 242) & (crop[:, :, 1] > 242) & (crop[:, :, 2] > 242)).mean()
+    if crop_white > 0.78 and bbox_ratio < 0.35:
+        return False
+
+    # 원단/디테일 확대는 썸네일 대표컷에서 제외. 옷걸이 단품은 중앙 여백이 있어 통과합니다.
+    if bbox_ratio > 0.90 and edge_density > 0.035:
         return False
     return True
 
@@ -313,12 +326,12 @@ def split_touching_images(pil_img: Image.Image, target_w: int, target_h: int):
 
     # 위아래로 길게 이어붙은 상세컷을 우선 분리합니다.
     pieces = []
-    if hcuts and (h / max(w, 1) > 1.25 or len(hcuts) >= 2):
+    if hcuts:
         bounds = [0] + hcuts + [h]
         for y1, y2 in zip(bounds[:-1], bounds[1:]):
             if y2 - y1 >= min_h:
                 pieces.append(img.crop((0, y1, w, y2)))
-    elif vcuts and (w / max(h, 1) > 1.15 or len(vcuts) >= 1):
+    elif vcuts:
         bounds = [0] + vcuts + [w]
         for x1, x2 in zip(bounds[:-1], bounds[1:]):
             if x2 - x1 >= min_w:
@@ -376,8 +389,28 @@ def edge_bleed_fix(pil_img: Image.Image, n: int = 3):
     return Image.fromarray(arr)
 
 
+def crop_to_single_subject(pil_img: Image.Image):
+    """텍스트/혜택 영역은 버리고, 썸네일로 쓸 1개 피사체 주변만 남깁니다."""
+    img = trim_edge_bands(pil_img).convert("RGB")
+    bbox = subject_bbox(img)
+    if bbox is None:
+        return img
+    w, h = img.size
+    l, t, r, b = bbox
+    bw, bh = r - l, b - t
+    # 피사체 주변 여백은 살리되, 상단/하단 설명 텍스트가 같이 들어오지 않도록 과한 여백은 제한합니다.
+    pad_x = max(10, int(bw * 0.10))
+    pad_y = max(12, int(bh * 0.08))
+    l = clamp(l - pad_x, 0, w - 1)
+    r = clamp(r + pad_x, 1, w)
+    t = clamp(t - pad_y, 0, h - 1)
+    b = clamp(b + pad_y, 1, h)
+    cropped = img.crop((l, t, r, b))
+    return trim_edge_bands(cropped)
+
+
 def make_thumbnail(pil_img: Image.Image, target_w: int, target_h: int):
-    cut = trim_edge_bands(pil_img)
+    cut = crop_to_single_subject(pil_img)
     cxy = subject_center(cut)
     out = resize_cover_then_crop(cut, target_w, target_h, center_xy=cxy)
     return edge_bleed_fix(out, n=3)
