@@ -433,6 +433,24 @@ def looks_like_mobile_or_brand_story(pil_img: Image.Image) -> bool:
         bottom_color = (bsat > 60).mean()
         if bbox_ratio < 0.26 and bottom_ink > 0.010 and bottom_color > 0.002 and light_plain > 0.35:
             return True
+
+    # 쇼핑몰 모바일 화면 캡처/캡션 카드: 상품은 작고, 하단 또는 중앙에 글자 박스/아이콘이 함께 있는 경우 제외
+    mid = arr[int(h*0.28):int(h*0.72), :, :]
+    if mid.size:
+        mlum = mid.mean(axis=2)
+        msat = mid.max(axis=2) - mid.min(axis=2)
+        mid_ink = (mlum < 95).mean()
+        mid_white_box = ((mlum > 235) & (msat < 18)).mean()
+        if bbox_ratio < 0.24 and (mid_ink > 0.020 or mid_white_box > 0.42) and edge > 0.012:
+            return True
+
+    # 넓은 검정/흰색 자막 박스가 있는 스타일컷은 썸네일 소재에서 제외
+    row_dark = (lum < 75).mean(axis=1)
+    row_white_plain = ((lum > 238) & (sat < 16)).mean(axis=1)
+    dark_bar_rows = (row_dark > 0.38).mean()
+    white_bar_rows = (row_white_plain > 0.82).mean()
+    if bbox_ratio < 0.32 and (dark_bar_rows > 0.035 or white_bar_rows > 0.11) and dark_ink > 0.006:
+        return True
     return False
 
 
@@ -460,6 +478,9 @@ def is_low_value_generated_piece(pil_img: Image.Image) -> bool:
     if bbox_ratio < 0.045:
         return True
     if (cx < 0.18 or cx > 0.82 or cy < 0.12 or cy > 0.88) and bbox_ratio < 0.22:
+        return True
+    # 상품 전체컷인데 피사체가 중앙에서 크게 벗어나면 제외
+    if bbox_ratio > 0.13 and (cx < 0.34 or cx > 0.66):
         return True
     # 상품 전체컷이 분할되어 상하가 잘린 조각: 피사체가 위/아래 경계를 동시에 강하게 침범하고 전체가 흰 배경이면 제외
     touches_top = t <= max(3, int(h*0.015))
@@ -812,32 +833,63 @@ def crop_subject_preserve_aspect(pil_img: Image.Image, target_w: int, target_h: 
     return img.crop((left, top, right, bottom))
 
 
-def resize_contain_centered(pil_img: Image.Image, target_w: int, target_h: int):
-    """상품 전체를 보존하면서 450x633 캔버스 중앙에 배치합니다.
-    남는 영역은 원본을 cover/blur 처리한 배경으로 채워 흰 줄/빈 여백 느낌을 줄입니다.
+def dominant_edge_bg_color(pil_img: Image.Image):
+    """캔버스 배경용 색상.
+    이미지를 늘리거나 블러 배경을 깔지 않고, 상세페이지 배경과 가까운 단색으로만 채웁니다.
     """
     img = pil_img.convert("RGB")
-    W, H = img.size
-    if W <= 0 or H <= 0:
+    arr = np.array(img).astype(np.int16)
+    h, w = arr.shape[:2]
+    band = max(2, min(h, w) // 18)
+    border = np.concatenate([
+        arr[:band, :, :].reshape(-1, 3),
+        arr[h-band:, :, :].reshape(-1, 3),
+        arr[:, :band, :].reshape(-1, 3),
+        arr[:, w-band:, :].reshape(-1, 3),
+    ], axis=0)
+    col = np.median(border, axis=0).astype(int)
+    return tuple(int(clamp(int(c), 0, 255)) for c in col)
+
+
+def pad_to_target_aspect(pil_img: Image.Image, target_w: int, target_h: int):
+    """비율 왜곡 없이 목표 비율로 패딩합니다.
+    절대 금지: 세로/가로로 억지 늘리기, 블러 배경, 원본 비율 파괴.
+    """
+    img = pil_img.convert("RGB")
+    w, h = img.size
+    if w <= 0 or h <= 0:
         return Image.new("RGB", (target_w, target_h), (255, 255, 255))
+    target_aspect = target_w / float(target_h)
+    cur_aspect = w / float(h)
+    if abs(cur_aspect - target_aspect) < 0.006:
+        return img
+    bg = dominant_edge_bg_color(img)
+    if cur_aspect > target_aspect:
+        new_w = w
+        new_h = int(round(w / target_aspect))
+    else:
+        new_h = h
+        new_w = int(round(h * target_aspect))
+    canvas = Image.new("RGB", (new_w, new_h), bg)
+    x = (new_w - w) // 2
+    y = (new_h - h) // 2
+    canvas.paste(img, (x, y))
+    return canvas
 
-    # 배경은 같은 이미지를 cover로 깔아 가장자리 흰줄과 과한 빈 여백을 줄임
-    bg = resize_cover_then_crop(img, target_w, target_h, center_xy=(W / 2.0, H / 2.0))
-    try:
-        bg = bg.filter(ImageFilter.GaussianBlur(radius=8))
-    except Exception:
-        pass
 
-    scale = min(target_w / float(W), target_h / float(H))
-    # 너무 작게 들어가면 썸네일 힘이 약해지므로, 피사체 보존 범위 안에서 약간 키움
-    scale = min(scale * 0.985, scale)
-    new_w, new_h = max(1, int(round(W * scale))), max(1, int(round(H * scale)))
-    fg = img.resize((new_w, new_h), Image.LANCZOS)
+def resize_no_distort(pil_img: Image.Image, target_w: int, target_h: int):
+    """목표 사이즈로 저장하되 원본 비율을 절대 왜곡하지 않습니다.
+    먼저 목표 비율로 패딩한 뒤 동일비율 리사이즈합니다.
+    """
+    img = pad_to_target_aspect(pil_img, target_w, target_h)
+    return img.resize((target_w, target_h), Image.LANCZOS)
 
-    x = int(round((target_w - new_w) / 2.0))
-    y = int(round((target_h - new_h) / 2.0))
-    bg.paste(fg, (x, y))
-    return bg
+
+def resize_contain_centered(pil_img: Image.Image, target_w: int, target_h: int):
+    """상품 전체 보존 모드.
+    v7의 블러/cover 배경 때문에 위아래가 늘어나 보이던 문제를 제거했습니다.
+    """
+    return resize_no_distort(pil_img, target_w, target_h)
 
 
 def is_cut_or_offcenter_thumb(pil_img: Image.Image) -> bool:
@@ -860,21 +912,17 @@ def is_cut_or_offcenter_thumb(pil_img: Image.Image) -> bool:
 
 
 def make_thumbnail(pil_img: Image.Image, target_w: int, target_h: int):
-    # 행거컷/상품 전체컷은 preserve 모드: 잘림 방지 + 중앙 배치가 최우선
+    # 행거컷/상품 전체컷은 잘림 방지 + 중앙 배치 + 비율 무왜곡이 최우선입니다.
     if is_full_product_or_hanger_cut(pil_img):
         cut = crop_subject_preserve_aspect(pil_img, target_w, target_h)
-        out = resize_contain_centered(cut, target_w, target_h)
-        # 혹시 contain 후에도 피사체가 너무 치우치면 bbox 기준 crop-preserve를 다시 시도
-        if is_cut_or_offcenter_thumb(out):
-            cut = crop_subject_preserve_aspect(cut, target_w, target_h)
-            out = resize_contain_centered(cut, target_w, target_h)
-        return edge_bleed_fix(out, n=3)
+        out = resize_no_distort(cut, target_w, target_h)
+        return edge_bleed_fix(out, n=2)
 
-    # 원단/디테일컷은 기존처럼 화면을 채우되 bbox 중심으로 리프레이밍
+    # 원단/디테일컷은 화면을 채우되, 결과가 왜곡되거나 과하게 잘리지 않도록 bbox 중심 crop만 사용합니다.
     cut = crop_to_single_subject(pil_img, target_w, target_h)
-    cxy = subject_center(cut)
-    out = resize_cover_then_crop(cut, target_w, target_h, center_xy=cxy)
-    return edge_bleed_fix(out, n=3)
+    cut = pad_to_target_aspect(cut, target_w, target_h)
+    out = cut.resize((target_w, target_h), Image.LANCZOS)
+    return edge_bleed_fix(out, n=2)
 
 
 # =========================
@@ -950,7 +998,7 @@ st.markdown(
     </style>
     <div class="misharp-title-wrap">
       <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
-      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V7</div>
+      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V8 FIXED</div>
       <div class="misharp-caption">1장=1피사체 / 흰줄·여백 제거 / 피사체 중앙 배치 / 기본 450×633 + 사용자 지정 사이즈</div>
     </div>
     <div class="rule-box">
