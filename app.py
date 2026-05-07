@@ -10,9 +10,9 @@ from bs4 import BeautifulSoup
 from PIL import Image
 
 # =========================
-# Output size (fixed)
+# Default output size
 # =========================
-TARGET_W, TARGET_H = 450, 633
+DEFAULT_TARGET_W, DEFAULT_TARGET_H = 450, 633
 
 HEADERS = {
     "User-Agent": (
@@ -36,147 +36,16 @@ def download_image(url: str) -> Image.Image:
     return Image.open(io.BytesIO(r.content)).convert("RGB")
 
 
-# =========================
-# 1) Conservative edge band trim (big white/black bars only)
-# =========================
-def trim_edge_bands(
-    pil_img: Image.Image,
-    solid_ratio_thr: float = 0.992,
-    std_thr: float = 7.5,
-    min_run: int = 10,
-    white_thr: int = 246,
-    black_thr: int = 9,
-):
-    img = pil_img.convert("RGB")
-    arr = np.array(img).astype(np.int16)
-    h, w = arr.shape[:2]
-
-    def row_is_band(y: int) -> bool:
-        row = arr[y, :, :]
-        row_std = row.std(axis=0).mean()
-        white_ratio = (row > white_thr).all(axis=1).mean()
-        black_ratio = (row < black_thr).all(axis=1).mean()
-        return row_std <= std_thr and (white_ratio >= solid_ratio_thr or black_ratio >= solid_ratio_thr)
-
-    def col_is_band(x: int) -> bool:
-        col = arr[:, x, :]
-        col_std = col.std(axis=0).mean()
-        white_ratio = (col > white_thr).all(axis=1).mean()
-        black_ratio = (col < black_thr).all(axis=1).mean()
-        return col_std <= std_thr and (white_ratio >= solid_ratio_thr or black_ratio >= solid_ratio_thr)
-
-    top, bottom = 0, h - 1
-    left, right = 0, w - 1
-
-    while True:
-        changed = False
-
-        run = 0
-        while top < bottom and row_is_band(top):
-            top += 1
-            run += 1
-        if run >= min_run:
-            changed = True
-
-        run = 0
-        while bottom > top and row_is_band(bottom):
-            bottom -= 1
-            run += 1
-        if run >= min_run:
-            changed = True
-
-        run = 0
-        while left < right and col_is_band(left):
-            left += 1
-            run += 1
-        if run >= min_run:
-            changed = True
-
-        run = 0
-        while right > left and col_is_band(right):
-            right -= 1
-            run += 1
-        if run >= min_run:
-            changed = True
-
-        # 과도 트림 방지
-        if (bottom - top) < 200 or (right - left) < 200:
-            return img
-
-        if not changed:
-            break
-
-        arr = arr[top : bottom + 1, left : right + 1, :]
-        img = Image.fromarray(arr.astype(np.uint8))
-        arr = np.array(img).astype(np.int16)
-        h, w = arr.shape[:2]
-        top, bottom, left, right = 0, h - 1, 0, w - 1
-
-    return img
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 
 # =========================
-# 2) Split long detail image by solid rows (white/black gaps)
-# =========================
-def should_split(pil_img: Image.Image) -> bool:
-    w, h = pil_img.size
-    return h >= int(w * 2.0)
-
-
-def split_detail_image_by_solid_rows(
-    pil_img: Image.Image,
-    white_thr: int = 246,
-    black_thr: int = 9,
-    solid_ratio: float = 0.992,
-    min_gap: int = 70,
-    min_cut_height: int = 220,
-    std_thr: float = 9.0,
-):
-    img = pil_img.convert("RGB")
-    arr = np.array(img).astype(np.int16)
-    h, w = arr.shape[:2]
-
-    row_white = (arr > white_thr).all(axis=2).mean(axis=1)
-    row_black = (arr < black_thr).all(axis=2).mean(axis=1)
-    row_std = arr.std(axis=1).mean(axis=1)
-
-    is_gap = ((row_white >= solid_ratio) | (row_black >= solid_ratio)) & (row_std <= std_thr)
-
-    gaps = []
-    in_gap = False
-    start = 0
-    for i, g in enumerate(is_gap):
-        if g and not in_gap:
-            in_gap = True
-            start = i
-        elif (not g) and in_gap:
-            if i - start >= min_gap:
-                gaps.append((start, i))
-            in_gap = False
-
-    if in_gap and h - start >= min_gap:
-        gaps.append((start, h))
-
-    cuts = []
-    prev = 0
-    for g1, g2 in gaps:
-        if g1 - prev >= min_cut_height:
-            cuts.append((prev, g1))
-        prev = g2
-
-    if h - prev >= min_cut_height:
-        cuts.append((prev, h))
-
-    return cuts
-
-
-# =========================
-# 3) Subject center (keep subject as close to frame center as possible)
+# Background / subject mask
 # =========================
 def estimate_background_color(arr_rgb: np.ndarray) -> np.ndarray:
     h, w = arr_rgb.shape[:2]
-    band = max(2, min(h, w) // 30)
-
+    band = max(2, min(h, w) // 28)
     border = np.concatenate(
         [
             arr_rgb[:band, :, :].reshape(-1, 3),
@@ -186,177 +55,336 @@ def estimate_background_color(arr_rgb: np.ndarray) -> np.ndarray:
         ],
         axis=0,
     ).astype(np.int16)
-
     return np.median(border, axis=0)
 
 
-def _subject_bbox_from_bg_diff(arr: np.ndarray, bg: np.ndarray):
-    h, w = arr.shape[:2]
-
-    diff = np.sqrt(((arr - bg) ** 2).sum(axis=2))
-    luminance = arr.mean(axis=2)
+def subject_mask(arr: np.ndarray) -> np.ndarray:
+    arr16 = arr.astype(np.int16)
+    bg = estimate_background_color(arr16)
+    diff = np.sqrt(((arr16 - bg) ** 2).sum(axis=2))
+    lum = arr16.mean(axis=2)
     bg_lum = float(bg.mean())
-    lum_diff = np.abs(luminance - bg_lum)
+    sat = arr16.max(axis=2) - arr16.min(axis=2)
 
-    # 배경이 매우 밝은 컷이 많아, 색차 + 밝기차를 함께 봅니다.
-    mask = (diff > 24) | (lum_diff > 18)
+    # 밝은 스튜디오 배경 + 어두운/컬러 피사체를 같이 잡습니다.
+    mask = (diff > 22) | (np.abs(lum - bg_lum) > 16) | ((sat > 28) & (diff > 12))
 
-    # 작은 잡음 제거: 행/열 방향으로 너무 적은 픽셀은 제외
-    row_ratio = mask.mean(axis=1)
-    col_ratio = mask.mean(axis=0)
-
-    rows = np.where(row_ratio > 0.01)[0]
-    cols = np.where(col_ratio > 0.01)[0]
-
-    if len(rows) == 0 or len(cols) == 0:
-        return None
-
-    top, bottom = int(rows[0]), int(rows[-1])
-    left, right = int(cols[0]), int(cols[-1])
-
-    # 지나치게 조이는 박스 방지: 약간의 숨통을 줍니다.
-    pad_x = max(6, int((right - left + 1) * 0.05))
-    pad_y = max(8, int((bottom - top + 1) * 0.05))
-
-    left = max(0, left - pad_x)
-    right = min(w - 1, right + pad_x)
-    top = max(0, top - pad_y)
-    bottom = min(h - 1, bottom + pad_y)
-
-    if (right - left) < max(40, int(w * 0.08)) or (bottom - top) < max(60, int(h * 0.08)):
-        return None
-
-    return (left, top, right, bottom)
+    # 순백/연회색 배경은 제거합니다.
+    white_bg = (arr16[:, :, 0] > 245) & (arr16[:, :, 1] > 245) & (arr16[:, :, 2] > 245)
+    mask = mask & (~white_bg)
+    return mask
 
 
-def _subject_bbox_from_edge_energy(arr: np.ndarray):
+def largest_component_bbox(mask: np.ndarray):
+    """Downscale mask에서 가장 큰 연결 성분 bbox를 찾습니다. scipy가 있으면 빠르게, 없으면 numpy 기반으로 동작."""
+    h, w = mask.shape
+    scale = min(1.0, 160.0 / max(h, w))
+    if scale < 1.0:
+        im = Image.fromarray((mask.astype(np.uint8) * 255))
+        small = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.NEAREST)
+        m = np.array(small) > 0
+    else:
+        m = mask.copy()
+
+    sh, sw = m.shape
+
+    try:
+        from scipy import ndimage as ndi  # Streamlit Cloud에 없을 경우 아래 fallback 사용
+        labels, num = ndi.label(m)
+        if num == 0:
+            return None
+        counts = np.bincount(labels.ravel())
+        counts[0] = 0
+        lab = int(counts.argmax())
+        ys, xs = np.where(labels == lab)
+        if len(xs) == 0:
+            return None
+        minx, maxx = int(xs.min()), int(xs.max())
+        miny, maxy = int(ys.min()), int(ys.max())
+        area = int(counts[lab])
+    except Exception:
+        # 빠른 fallback: 행/열 투영 bbox. 완전한 연결성은 아니지만 텍스트/피사체 필터에는 충분합니다.
+        rows = np.where(m.mean(axis=1) > 0.01)[0]
+        cols = np.where(m.mean(axis=0) > 0.01)[0]
+        if len(rows) == 0 or len(cols) == 0:
+            return None
+        minx, maxx = int(cols[0]), int(cols[-1])
+        miny, maxy = int(rows[0]), int(rows[-1])
+        area = int(m.sum())
+
+    sx, sy = w / sw, h / sh
+    return (int(minx * sx), int(miny * sy), int((maxx + 1) * sx), int((maxy + 1) * sy), int(area / (sw * sh) * w * h))
+
+
+def subject_bbox(pil_img: Image.Image):
+    img = pil_img.convert("RGB")
+    arr = np.array(img)
     h, w = arr.shape[:2]
-    gray = arr.mean(axis=2)
+    mask = subject_mask(arr)
 
-    gx = np.abs(np.diff(gray, axis=1))
-    gy = np.abs(np.diff(gray, axis=0))
-
-    col_energy = np.pad(gx.sum(axis=0), (0, 1))
-    row_energy = np.pad(gy.sum(axis=1), (0, 1))
-
-    col_thr = np.percentile(col_energy, 65)
-    row_thr = np.percentile(row_energy, 65)
-
-    cols = np.where(col_energy > col_thr)[0]
-    rows = np.where(row_energy > row_thr)[0]
-
+    comp = largest_component_bbox(mask)
+    rows = np.where(mask.mean(axis=1) > 0.006)[0]
+    cols = np.where(mask.mean(axis=0) > 0.006)[0]
     if len(rows) == 0 or len(cols) == 0:
         return None
 
-    left, right = int(cols[0]), int(cols[-1])
-    top, bottom = int(rows[0]), int(rows[-1])
+    # 연결 성분이 충분하면 그것을 우선 사용, 아니면 전체 mask bbox 사용
+    if comp is not None:
+        l, t, r, b, area = comp
+        comp_ratio = area / float(w * h)
+        comp_h_ratio = (b - t) / float(h)
+        comp_w_ratio = (r - l) / float(w)
+        if comp_ratio > 0.015 and comp_h_ratio > 0.14 and comp_w_ratio > 0.07:
+            left, top, right, bottom = l, t, r, b
+        else:
+            left, right = int(cols[0]), int(cols[-1])
+            top, bottom = int(rows[0]), int(rows[-1])
+    else:
+        left, right = int(cols[0]), int(cols[-1])
+        top, bottom = int(rows[0]), int(rows[-1])
 
-    pad_x = max(6, int((right - left + 1) * 0.04))
-    pad_y = max(8, int((bottom - top + 1) * 0.04))
-
-    left = max(0, left - pad_x)
-    right = min(w - 1, right + pad_x)
-    top = max(0, top - pad_y)
-    bottom = min(h - 1, bottom + pad_y)
-
+    pad_x = max(5, int((right - left + 1) * 0.04))
+    pad_y = max(6, int((bottom - top + 1) * 0.035))
+    left = clamp(left - pad_x, 0, w - 1)
+    right = clamp(right + pad_x, 1, w)
+    top = clamp(top - pad_y, 0, h - 1)
+    bottom = clamp(bottom + pad_y, 1, h)
+    if (right - left) < 30 or (bottom - top) < 40:
+        return None
     return (left, top, right, bottom)
 
 
-def subject_center(pil_img: Image.Image):
+def has_usable_subject(pil_img: Image.Image) -> bool:
+    """본문 설명/원단 확대/텍스트 이미지 등 썸네일 부적합 이미지를 최대한 제외."""
+    img = pil_img.convert("RGB")
+    w, h = img.size
+    if w < 180 or h < 180:
+        return False
+    arr = np.array(img)
+    bbox = subject_bbox(img)
+    if bbox is None:
+        return False
+    l, t, r, b = bbox
+    bw, bh = r - l, b - t
+    bbox_ratio = (bw * bh) / float(w * h)
+    height_ratio = bh / float(h)
+    width_ratio = bw / float(w)
+
+    # 텍스트/배너 컷: 흰 배경이 과도하고 피사체 연결 성분이 작거나 납작하면 제외
+    white_ratio = ((arr[:, :, 0] > 242) & (arr[:, :, 1] > 242) & (arr[:, :, 2] > 242)).mean()
+    gray = arr.mean(axis=2).astype(np.float32)
+    gx = np.abs(np.diff(gray, axis=1)).mean()
+    gy = np.abs(np.diff(gray, axis=0)).mean()
+    edge_density = ((np.abs(np.diff(gray, axis=1)) > 22).mean() + (np.abs(np.diff(gray, axis=0)) > 22).mean()) / 2
+
+    if height_ratio < 0.22 or width_ratio < 0.10:
+        return False
+    if bbox_ratio < 0.035:
+        return False
+    if white_ratio > 0.72 and bbox_ratio < 0.30 and edge_density > 0.035:
+        return False
+    # 안내/혜택/문구형 이미지는 가로 전체에 텍스트/그래픽이 퍼지고 세로 피사체가 부족합니다.
+    if width_ratio > 0.88 and height_ratio < 0.86 and white_ratio > 0.34:
+        return False
+    if white_ratio > 0.86 and height_ratio < 0.55:
+        return False
+    # 원단/디테일 확대는 피사체가 화면 전체를 채우는 경우가 많지만 썸네일로는 부적합
+    # 인물/상품 컷은 대개 배경 여백과 명확한 피사체 bbox가 함께 존재합니다.
+    if bbox_ratio > 0.92 and max(gx, gy) > 5.5:
+        return False
+    return True
+
+
+# =========================
+# Trimming / splitting
+# =========================
+def trim_edge_bands(pil_img: Image.Image, white_thr: int = 246, black_thr: int = 9):
+    """가장자리의 큰 흰/검정 띠를 벡터 방식으로 빠르게 제거."""
     img = pil_img.convert("RGB")
     arr = np.array(img).astype(np.int16)
     h, w = arr.shape[:2]
-    bg = estimate_background_color(arr)
+    solid_ratio_thr = 0.985
+    std_thr = 10.0
 
-    bbox = _subject_bbox_from_bg_diff(arr, bg)
-    if bbox is None:
-        bbox = _subject_bbox_from_edge_energy(arr)
+    row_white = (arr > white_thr).all(axis=2).mean(axis=1)
+    row_black = (arr < black_thr).all(axis=2).mean(axis=1)
+    row_std = arr.std(axis=1).mean(axis=1)
+    row_band = ((row_white >= solid_ratio_thr) | (row_black >= solid_ratio_thr)) & (row_std <= std_thr)
 
+    col_white = (arr > white_thr).all(axis=2).mean(axis=0)
+    col_black = (arr < black_thr).all(axis=2).mean(axis=0)
+    col_std = arr.std(axis=0).mean(axis=1)
+    col_band = ((col_white >= solid_ratio_thr) | (col_black >= solid_ratio_thr)) & (col_std <= std_thr)
+
+    top = 0
+    while top < h - 1 and row_band[top]:
+        top += 1
+    bottom = h - 1
+    while bottom > top and row_band[bottom]:
+        bottom -= 1
+    left = 0
+    while left < w - 1 and col_band[left]:
+        left += 1
+    right = w - 1
+    while right > left and col_band[right]:
+        right -= 1
+
+    if (right - left + 1) < max(160, w * 0.35) or (bottom - top + 1) < max(160, h * 0.35):
+        return img
+    return img.crop((left, top, right + 1, bottom + 1))
+
+def _runs_from_bool(flags, min_len):
+    runs, start = [], None
+    for i, v in enumerate(flags):
+        if v and start is None:
+            start = i
+        elif (not v) and start is not None:
+            if i - start >= min_len:
+                runs.append((start, i))
+            start = None
+    if start is not None and len(flags) - start >= min_len:
+        runs.append((start, len(flags)))
+    return runs
+
+
+def _solid_gap_cuts(arr, axis: int, min_gap: int):
+    # axis=0 horizontal row cuts, axis=1 vertical col cuts
+    a = arr.astype(np.int16)
+    white_thr, black_thr = 246, 9
+    if axis == 0:
+        white = (a > white_thr).all(axis=2).mean(axis=1)
+        black = (a < black_thr).all(axis=2).mean(axis=1)
+        std = a.std(axis=1).mean(axis=1)
+    else:
+        white = (a > white_thr).all(axis=2).mean(axis=0)
+        black = (a < black_thr).all(axis=2).mean(axis=0)
+        std = a.std(axis=0).mean(axis=1)
+    flags = ((white > 0.965) | (black > 0.965)) & (std < 13)
+    return [int((s + e) / 2) for s, e in _runs_from_bool(flags, min_gap)]
+
+
+def _seam_cuts(arr, axis: int, min_piece: int):
+    """붙어있는 2장 이상 사진의 경계선 탐지. 흰 여백이 없어도 색/명암 급변 라인을 잡습니다."""
+    gray = arr.mean(axis=2).astype(np.float32)
+    if axis == 0:
+        # 인접 행의 전체 폭 평균 변화량
+        score = np.abs(np.diff(gray, axis=0)).mean(axis=1)
+        length = arr.shape[0]
+    else:
+        score = np.abs(np.diff(gray, axis=1)).mean(axis=0)
+        length = arr.shape[1]
+    if len(score) < min_piece * 2:
+        return []
+    med = float(np.median(score))
+    p98 = float(np.percentile(score, 98))
+    p995 = float(np.percentile(score, 99.5))
+    thr = max(med * 4.0, p98 * 1.18, 10.0)
+    candidates = np.where(score >= thr)[0] + 1
+    cuts = []
+    for c in candidates:
+        if c < min_piece or length - c < min_piece:
+            continue
+        # 너무 가까운 경계는 가장 강한 것 하나만 유지
+        if cuts and c - cuts[-1] < min_piece:
+            prev = cuts[-1]
+            if score[c - 1] > score[prev - 1]:
+                cuts[-1] = int(c)
+        else:
+            cuts.append(int(c))
+    # 경계가 너무 많으면 강한 것 위주로만
+    if len(cuts) > 6:
+        cuts = sorted(cuts, key=lambda x: score[x - 1], reverse=True)[:6]
+        cuts = sorted(cuts)
+    return cuts
+
+
+def split_touching_images(pil_img: Image.Image, target_w: int, target_h: int):
+    """상세 이미지 한 장 안에 여러 사진이 위아래/좌우로 붙은 경우 분리."""
+    img = trim_edge_bands(pil_img)
+    arr = np.array(img.convert("RGB"))
+    h, w = arr.shape[:2]
+    min_h = max(220, int(target_h * 0.55))
+    min_w = max(180, int(target_w * 0.50))
+
+    hcuts = _solid_gap_cuts(arr, axis=0, min_gap=max(8, h // 140)) + _seam_cuts(arr, axis=0, min_piece=min_h)
+    vcuts = _solid_gap_cuts(arr, axis=1, min_gap=max(8, w // 140)) + _seam_cuts(arr, axis=1, min_piece=min_w)
+    hcuts = sorted(set([c for c in hcuts if min_h <= c <= h - min_h]))
+    vcuts = sorted(set([c for c in vcuts if min_w <= c <= w - min_w]))
+
+    # 위아래로 길게 이어붙은 상세컷을 우선 분리합니다.
+    pieces = []
+    if hcuts and (h / max(w, 1) > 1.25 or len(hcuts) >= 2):
+        bounds = [0] + hcuts + [h]
+        for y1, y2 in zip(bounds[:-1], bounds[1:]):
+            if y2 - y1 >= min_h:
+                pieces.append(img.crop((0, y1, w, y2)))
+    elif vcuts and (w / max(h, 1) > 1.15 or len(vcuts) >= 1):
+        bounds = [0] + vcuts + [w]
+        for x1, x2 in zip(bounds[:-1], bounds[1:]):
+            if x2 - x1 >= min_w:
+                pieces.append(img.crop((x1, 0, x2, h)))
+    else:
+        pieces = [img]
+
+    # 과분할/무한 재귀 방지를 위해 1차 경계선 기준으로만 분리합니다.
+    return pieces
+
+
+# =========================
+# Thumbnail generation
+# =========================
+def subject_center(pil_img: Image.Image):
+    bbox = subject_bbox(pil_img)
+    w, h = pil_img.size
     if bbox is None:
         return (w / 2.0, h / 2.0)
-
-    left, top, right, bottom = bbox
-    cx = (left + right) / 2.0
-    cy = (top + bottom) / 2.0
-    return (float(cx), float(cy))
+    l, t, r, b = bbox
+    return ((l + r) / 2.0, (t + b) / 2.0)
 
 
-# =========================
-# 4) Uniform cover resize then crop (NO distortion)
-# =========================
-def resize_cover_then_crop(pil_img: Image.Image, center_xy=None):
+def resize_cover_then_crop(pil_img: Image.Image, target_w: int, target_h: int, center_xy=None):
     img = pil_img.convert("RGB")
     W, H = img.size
-
-    scale = max(TARGET_W / W, TARGET_H / H)
-    new_w = int(round(W * scale))
-    new_h = int(round(H * scale))
-
+    scale = max(target_w / W, target_h / H)
+    new_w, new_h = int(round(W * scale)), int(round(H * scale))
     resized = img.resize((new_w, new_h), Image.LANCZOS)
 
     if center_xy is None:
-        cx, cy = (new_w / 2.0, new_h / 2.0)
+        cx, cy = new_w / 2.0, new_h / 2.0
     else:
         ox, oy = center_xy
-        cx, cy = (ox * scale, oy * scale)
+        cx, cy = ox * scale, oy * scale
 
-    left = int(round(cx - TARGET_W / 2.0))
-    top = int(round(cy - TARGET_H / 2.0))
-
-    left = max(0, min(left, new_w - TARGET_W))
-    top = max(0, min(top, new_h - TARGET_H))
-
-    return resized.crop((left, top, left + TARGET_W, top + TARGET_H))
+    left = int(round(cx - target_w / 2.0))
+    top = int(round(cy - target_h / 2.0))
+    left = clamp(left, 0, max(0, new_w - target_w))
+    top = clamp(top, 0, max(0, new_h - target_h))
+    return resized.crop((left, top, left + target_w, top + target_h))
 
 
-# =========================
-# 5) NEW: Edge bleed fix (kills 1px white lines without cropping)
-# =========================
-def edge_bleed_fix(pil_img: Image.Image, n: int = 2):
-    """
-    ✅ 450×633 최종 이미지에서:
-    가장자리 1~2px 라인을 "안쪽 픽셀"로 덮어써서 흰줄/검정줄을 물리적으로 제거.
-    - 크기 변화 없음
-    - 프레이밍 변화 없음
-    - 늘림/변형 없음
-    """
+def edge_bleed_fix(pil_img: Image.Image, n: int = 3):
     img = pil_img.convert("RGB")
     arr = np.array(img).copy()
     h, w = arr.shape[:2]
-    n = max(1, min(n, 4))
+    n = max(1, min(n, 5))
     if h <= 2 * n + 2 or w <= 2 * n + 2:
         return img
-
-    # top n rows <- row n
     arr[0:n, :, :] = arr[n : n + 1, :, :]
-    # bottom n rows <- row h-1-n
     arr[h - n : h, :, :] = arr[h - n - 1 : h - n, :, :]
-    # left n cols <- col n
     arr[:, 0:n, :] = arr[:, n : n + 1, :]
-    # right n cols <- col w-1-n
     arr[:, w - n : w, :] = arr[:, w - n - 1 : w - n, :]
-
     return Image.fromarray(arr)
 
 
-def make_thumb_450x633(pil_img: Image.Image):
-    # A) 큰 띠 제거(흰/검정 바)
+def make_thumbnail(pil_img: Image.Image, target_w: int, target_h: int):
     cut = trim_edge_bands(pil_img)
-
-    # B) 피사체 중심(중심 이동만)
     cxy = subject_center(cut)
-
-    # C) 비율 유지 cover + 중심 이동 크롭
-    out = resize_cover_then_crop(cut, center_xy=cxy)
-
-    # D) ✅ 1~2px 흰줄 제거는 "크롭"이 아니라 "엣지 덮어쓰기"로 처리
-    out = edge_bleed_fix(out, n=2)
-
-    return out
+    out = resize_cover_then_crop(cut, target_w, target_h, center_xy=cxy)
+    return edge_bleed_fix(out, n=3)
 
 
 # =========================
-# URL: extract ONLY from detail content area
+# URL extraction
 # =========================
 DETAIL_CONTAINER_SELECTORS = [
     "#prdDetailContent",
@@ -365,60 +393,48 @@ DETAIL_CONTAINER_SELECTORS = [
     ".xans-product-detaildesign",
     ".xans-product-additional",
     "#productDetail",
+    ".cont_detail",
+    ".detailArea",
 ]
 
 
 def extract_detail_image_urls_only(page_url: str, max_images: int = 250) -> list[str]:
     html = requests.get(page_url, headers=HEADERS, timeout=25).text
     soup = BeautifulSoup(html, "lxml")
-
     container = None
     for sel in DETAIL_CONTAINER_SELECTORS:
         container = soup.select_one(sel)
         if container:
             break
-
     scope = container if container else soup
-
     urls = []
     for img in scope.select("img"):
-        src = (img.get("src") or img.get("data-src") or img.get("data-original") or "").strip()
-        if not src:
+        src = (img.get("src") or img.get("data-src") or img.get("ec-data-src") or img.get("data-original") or "").strip()
+        if not src or src.startswith("data:"):
             continue
-
         full = urljoin(page_url, src)
-        if full.startswith("data:"):
-            continue
-
         if full not in urls:
             urls.append(full)
-
         if len(urls) >= max_images:
             break
-
     return urls
 
 
 # =========================
 # Processing
 # =========================
-def process_image_any(pil_img: Image.Image, prefix: str):
-    outputs = []
+def process_image_any(pil_img: Image.Image, prefix: str, target_w: int, target_h: int, skip_no_subject: bool = True):
+    outputs, skipped = [], []
+    pieces = split_touching_images(pil_img, target_w, target_h)
 
-    if should_split(pil_img):
-        segments = split_detail_image_by_solid_rows(pil_img)
-        if not segments:
-            segments = [(0, pil_img.height)]
-
-        for idx, (y1, y2) in enumerate(segments, start=1):
-            piece = pil_img.crop((0, y1, pil_img.width, y2))
-            thumb = make_thumb_450x633(piece)
-            outputs.append((f"{prefix}_{idx:02d}_{TARGET_W}x{TARGET_H}.jpg", thumb))
-    else:
-        thumb = make_thumb_450x633(pil_img)
-        outputs.append((f"{prefix}_01_{TARGET_W}x{TARGET_H}.jpg", thumb))
-
-    return outputs
+    for idx, piece in enumerate(pieces, start=1):
+        piece = trim_edge_bands(piece)
+        if skip_no_subject and not has_usable_subject(piece):
+            skipped.append((f"{prefix}_{idx:02d}", "피사체 없음/텍스트·원단·디테일 컷으로 판단"))
+            continue
+        thumb = make_thumbnail(piece, target_w, target_h)
+        outputs.append((f"{prefix}_{idx:02d}_{target_w}x{target_h}.jpg", thumb))
+    return outputs, skipped
 
 
 # =========================
@@ -433,35 +449,53 @@ st.markdown(
       .misharp-title { font-size: 1.55rem; font-weight: 800; letter-spacing: -0.02em; margin: 0; }
       .misharp-sub { font-size: 0.78rem; color: #666; margin-top: 6px; }
       .misharp-caption { color:#666; font-size: 0.92rem; margin-top: 8px; }
+      .rule-box {background:#fff7f7; border:1px solid #f1c4c4; border-radius:12px; padding:12px 14px; color:#5b1b1b; font-size:0.93rem; line-height:1.55;}
     </style>
     <div class="misharp-title-wrap">
       <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
-      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V1</div>
-      <div class="misharp-caption">비율 왜곡 0 / 여백 0 / 피사체 중앙 정렬 강화 / 1~2px 흰줄은 Edge Bleed로 제거</div>
+      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V2</div>
+      <div class="misharp-caption">1장=1피사체 / 흰줄·여백 제거 / 피사체 중앙 배치 / 기본 450×633 + 사용자 지정 사이즈</div>
+    </div>
+    <div class="rule-box">
+      절대원칙: 썸네일 1개에는 피사체 1개만 남깁니다. 두 장이 붙어 있는 상세컷은 경계선을 찾아 분리하고, 피사체 없는 안내/텍스트/원단 확대 컷은 자동 제외합니다.
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-with st.expander("고급 옵션", expanded=False):
+with st.expander("생성 옵션", expanded=True):
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        target_w = st.number_input("가로(px)", min_value=200, max_value=2000, value=DEFAULT_TARGET_W, step=10)
+    with c2:
+        target_h = st.number_input("세로(px)", min_value=200, max_value=3000, value=DEFAULT_TARGET_H, step=10)
+    with c3:
+        preset = st.selectbox("빠른 사이즈", ["기본 450×633", "정사각 1000×1000", "세로 800×1200", "가로 1200×800", "직접 입력"], index=0)
+        if preset == "기본 450×633":
+            target_w, target_h = 450, 633
+        elif preset == "정사각 1000×1000":
+            target_w, target_h = 1000, 1000
+        elif preset == "세로 800×1200":
+            target_w, target_h = 800, 1200
+        elif preset == "가로 1200×800":
+            target_w, target_h = 1200, 800
     max_images = st.slider("상세영역에서 수집할 최대 이미지 수", 50, 600, 250, step=50)
-    st.write("※ 변형 금지: 비율 유지(Uniform) 리사이즈만 사용합니다.")
-    st.write("※ 여백 금지: 450×633 Cover 방식으로만 생성합니다.")
-    st.write("※ 피사체 중앙 정렬 강화: 배경색 차이 + 윤곽 에너지 기준으로 피사체 박스를 잡아 최대한 중앙에 오도록 이동 크롭합니다.")
-    st.write("※ 미세 흰줄 금지: 최종 결과 가장자리 1~2px를 안쪽 픽셀로 덮어써서 제거합니다(크기/프레임 유지).")
+    skip_no_subject = st.checkbox("피사체 없는 이미지 자동 제외", value=True)
+    st.caption("비율 왜곡 없이 Cover 방식으로 채우며, 최종 가장자리 1~3px는 안쪽 픽셀로 덮어 흰줄을 제거합니다.")
+
+all_outputs = []
+skipped_all = []
 
 tab1, tab2, tab3 = st.tabs(["① 상세페이지 URL", "② 이미지 주소(URL)", "③ 이미지 업로드"])
-all_outputs = []
 
 with tab1:
-    page_url = st.text_input("상세페이지 URL", placeholder="https://.../product/detail.html?product_no=28461")
-    if st.button("URL에서 '본문 상세이미지'만 수집 → 생성", type="primary", key="go1"):
+    page_url = st.text_input("상세페이지 URL", placeholder="https://.../product/detail.html?product_no=28772")
+    if st.button("URL에서 본문 상세이미지 수집 → 썸네일 생성", type="primary", key="go1"):
         if not page_url.strip():
             st.error("상세페이지 URL을 입력해주세요.")
         else:
             with st.spinner("본문 상세영역 이미지 URL 수집 중…"):
                 urls = extract_detail_image_urls_only(page_url.strip(), max_images=max_images)
-
             if not urls:
                 st.error("본문(상세영역)에서 이미지 URL을 찾지 못했습니다. 테마 구조가 다를 수 있어요.")
             else:
@@ -469,12 +503,14 @@ with tab1:
                     for i, u in enumerate(urls, start=1):
                         try:
                             pil = download_image(u)
-                            all_outputs += process_image_any(pil, f"url{i:03d}")
-                        except Exception:
-                            continue
+                            outs, skips = process_image_any(pil, f"url{i:03d}", int(target_w), int(target_h), skip_no_subject)
+                            all_outputs += outs
+                            skipped_all += skips
+                        except Exception as e:
+                            skipped_all.append((f"url{i:03d}", f"다운로드/처리 실패: {e}"))
 
 with tab2:
-    st.write("이미지 URL을 여러 줄로 붙여넣으세요. (각 줄 1개)")
+    st.write("이미지 URL을 여러 줄로 붙여넣으세요. 각 줄 1개")
     url_text = st.text_area("이미지 주소 목록", height=180, placeholder="https://.../a.jpg\nhttps://.../b.jpg\n...")
     if st.button("이미지 주소로 생성", type="primary", key="go2"):
         lines = [l.strip() for l in (url_text or "").splitlines() if l.strip()]
@@ -485,47 +521,55 @@ with tab2:
                 for i, u in enumerate(lines, start=1):
                     try:
                         pil = download_image(u)
-                        all_outputs += process_image_any(pil, f"img{i:03d}")
-                    except Exception:
-                        continue
+                        outs, skips = process_image_any(pil, f"img{i:03d}", int(target_w), int(target_h), skip_no_subject)
+                        all_outputs += outs
+                        skipped_all += skips
+                    except Exception as e:
+                        skipped_all.append((f"img{i:03d}", f"다운로드/처리 실패: {e}"))
 
 with tab3:
-    uploads = st.file_uploader(
-        "상세페이지 이미지 업로드 (여러 장 가능)",
-        type=["jpg", "jpeg", "png", "webp"],
-        accept_multiple_files=True,
-    )
+    uploads = st.file_uploader("상세페이지 이미지 업로드 (여러 장 가능)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True)
     if uploads:
         with st.spinner(f"업로드 이미지 처리 중… ({len(uploads)}개)"):
             for i, f in enumerate(uploads, start=1):
                 try:
                     pil = Image.open(f).convert("RGB")
                     base = safe_name(f.name.rsplit(".", 1)[0])
-                    all_outputs += process_image_any(pil, f"up{i:03d}_{base}")
-                except Exception:
-                    continue
+                    outs, skips = process_image_any(pil, f"up{i:03d}_{base}", int(target_w), int(target_h), skip_no_subject)
+                    all_outputs += outs
+                    skipped_all += skips
+                except Exception as e:
+                    skipped_all.append((f"up{i:03d}_{f.name}", f"업로드 처리 실패: {e}"))
 
 if all_outputs:
-    st.success(f"총 {len(all_outputs)}장 생성 완료 (모두 {TARGET_W}×{TARGET_H}, 흰줄 제거 포함)")
-    st.subheader("미리보기 (일부)")
-    st.image([img for _, img in all_outputs[:24]], width=180)
+    st.success(f"총 {len(all_outputs)}장 생성 완료 ({int(target_w)}×{int(target_h)})")
+    st.subheader("미리보기")
+    st.image([img for _, img in all_outputs[:36]], width=180)
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, img in all_outputs:
             buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=95)
+            img.save(buf, format="JPEG", quality=95, optimize=True)
             zf.writestr(name, buf.getvalue())
+        if skipped_all:
+            report = "\n".join([f"{name}\t{reason}" for name, reason in skipped_all])
+            zf.writestr("_skipped_images_report.txt", report)
     zip_buf.seek(0)
 
     st.download_button(
-        "ZIP 다운로드 (450×633)",
+        f"ZIP 다운로드 ({int(target_w)}×{int(target_h)})",
         data=zip_buf,
-        file_name=f"thumb_{TARGET_W}x{TARGET_H}.zip",
+        file_name=f"misharp_thumbnails_{int(target_w)}x{int(target_h)}.zip",
         mime="application/zip",
     )
 else:
     st.info("아직 결과가 없습니다. 위 탭에서 입력 후 생성해보세요.")
+
+if skipped_all:
+    with st.expander(f"자동 제외/실패 목록 보기 ({len(skipped_all)}개)", expanded=False):
+        for name, reason in skipped_all[:200]:
+            st.write(f"- {name}: {reason}")
 
 st.markdown(
     """
@@ -535,12 +579,9 @@ st.markdown(
         본 프로그램의 저작권은 미샵컴퍼니(misharpcompany)에 있으며, 무단 복제·배포·사용을 금합니다.<br>
         본 프로그램은 미샵컴퍼니 내부 직원 전용으로, 외부 유출 및 제3자 제공을 엄격히 금합니다.
         <br><br>
-        ⓒ misharpcompany. All rights reserved.<br>
         This program is the intellectual property of misharpcompany.
-        Unauthorized copying, distribution, or use is strictly prohibited.<br>
-        This program is for internal use by misharpcompany employees only
-        and must not be disclosed or shared externally.
+        Unauthorized copying, distribution, or use is strictly prohibited.
     </div>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
