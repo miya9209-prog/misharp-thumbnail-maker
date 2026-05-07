@@ -482,22 +482,51 @@ def run_with_progress(urls, prefix_fmt, target_w, target_h, skip_no_subject, max
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(layout="wide")
+st.set_page_config(
+    page_title="미샵 썸네일 생성기 | MISHARP Thumbnail Generator",
+    page_icon="🖼️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# SEO 메타태그 + 구조화 데이터 주입
 st.markdown("""
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="미샵 상세페이지 이미지에서 쇼핑몰 등록용 썸네일을 자동 생성하는 도구. 피사체 자동 감지, 여백 제거, 450×633 리사이즈, ZIP 일괄 다운로드 지원. misharpcompany 내부 전용.">
+  <meta name="keywords" content="미샵, 썸네일 생성기, 쇼핑몰 썸네일, 상품 이미지, Cafe24, 이미지 리사이즈, 상세페이지, MISHARP, misharpcompany">
+  <meta name="author" content="misharpcompany">
+  <meta name="robots" content="noindex, nofollow">
+  <meta property="og:title" content="미샵 썸네일 생성기 | MISHARP Thumbnail Generator">
+  <meta property="og:description" content="상세페이지 URL 입력 한 번으로 쇼핑몰 썸네일 자동 생성. 피사체 중앙 배치, 흰여백 자동 제거, 450×633 일괄 출력.">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="MISHARP Tools">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "미샵 썸네일 생성기",
+    "alternateName": "MISHARP Thumbnail Generator",
+    "description": "쇼핑몰 상세페이지 이미지에서 썸네일을 자동 추출·생성하는 내부 도구",
+    "applicationCategory": "UtilitiesApplication",
+    "author": {
+      "@type": "Organization",
+      "name": "misharpcompany",
+      "url": "https://misharp.co.kr"
+    },
+    "offers": {"@type": "Offer", "price": "0"}
+  }
+  </script>
+</head>
 <style>
   .misharp-title-wrap{margin-top:8px;margin-bottom:6px;}
   .misharp-title{font-size:1.55rem;font-weight:800;letter-spacing:-0.02em;margin:0;}
-  .misharp-sub{font-size:0.78rem;color:#666;margin-top:6px;}
-  .misharp-caption{color:#666;font-size:0.92rem;margin-top:8px;}
-  .rule-box{background:#fff7f7;border:1px solid #f1c4c4;border-radius:12px;padding:12px 14px;color:#5b1b1b;font-size:0.93rem;line-height:1.55;}
+  .misharp-sub{font-size:0.78rem;color:#888;margin-top:4px;}
 </style>
 <div class="misharp-title-wrap">
-  <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
-  <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V5 — 여백제거 강화 / 전신샷 보정 / 진행바 / 병렬처리</div>
-  <div class="misharp-caption">1장=1피사체 / 흰줄·여백 제거 / 피사체 중앙 배치 / 기본 450×633</div>
-</div>
-<div class="rule-box">
-  절대원칙: 썸네일 1개에는 피사체 1개만 남깁니다. 두 장이 붙어 있는 상세컷은 경계선을 찾아 분리하고, 피사체 없는 안내/텍스트/원단 확대 컷은 자동 제외합니다.
+  <div class="misharp-title">MISHARP 썸네일 생성기</div>
+  <div class="misharp-sub">MISHARP Thumbnail Generator · misharpcompany</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -519,7 +548,6 @@ with st.expander("생성 옵션", expanded=True):
         skip_no_subject = st.checkbox("피사체 없는 이미지 자동 제외", value=True)
     with col_b:
         max_workers = st.slider("동시 처리 수 (빠를수록 서버 부하↑)", 1, 8, 4, step=1)
-    st.caption("비율 왜곡 없이 Cover 방식으로 채우며, 최종 가장자리 1~3px는 안쪽 픽셀로 덮어 흰줄을 제거합니다.")
 
 all_outputs = []
 skipped_all = []
@@ -605,9 +633,7 @@ if skipped_all:
 
 st.markdown("""
 <hr style="margin-top:40px;margin-bottom:10px;">
-<div style="font-size:11px;color:#888;line-height:1.5;text-align:center;">
-    ⓒ misharpcompany. All rights reserved.<br>
-    본 프로그램의 저작권은 미샵컴퍼니(misharpcompany)에 있으며, 무단 복제·배포·사용을 금합니다.<br>
-    본 프로그램은 미샵컴퍼니 내부 직원 전용으로, 외부 유출 및 제3자 제공을 엄격히 금합니다.
+<div style="font-size:11px;color:#aaa;line-height:1.6;text-align:center;">
+    ⓒ misharpcompany. All rights reserved. 본 프로그램은 미샵컴퍼니 내부 전용입니다.
 </div>
 """, unsafe_allow_html=True)
