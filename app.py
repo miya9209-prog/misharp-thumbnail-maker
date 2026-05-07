@@ -188,10 +188,10 @@ def is_text_or_notice_image(pil_img: Image.Image) -> bool:
 
 def has_usable_subject(pil_img: Image.Image) -> bool:
     """썸네일 소재 판단.
-    v4 기준: 모델컷뿐 아니라 행거컷, 원단컷, 허리/밑단/봉제 디테일컷도 허용합니다.
+    v5 기준: 모델컷뿐 아니라 행거컷, 원단컷, 허리/밑단/봉제 디테일컷도 허용합니다.
     제외 대상은 피사체 없는 공지/사이즈표/텍스트 카드/빈 배경입니다.
     """
-    img = remove_text_bands(trim_edge_bands(pil_img)).convert("RGB")
+    img = trim_edge_bands(pil_img).convert("RGB")
     w, h = img.size
     if w < 160 or h < 160:
         return False
@@ -322,6 +322,68 @@ def remove_text_bands(pil_img: Image.Image):
     out = img.crop((0, top_cut, w, bottom_cut))
     return trim_edge_bands(out)
 
+
+
+def bbox_area(bbox):
+    if not bbox:
+        return 0
+    l,t,r,b=bbox
+    return max(0,r-l)*max(0,b-t)
+
+
+def safe_remove_text_bands(pil_img: Image.Image):
+    """상품 보존 우선 텍스트 제거.
+    텍스트 제거 결과가 피사체를 반으로 자르거나, 너무 작은 조각을 만들면 원본을 유지합니다.
+    """
+    original = trim_edge_bands(pil_img).convert("RGB")
+    w,h = original.size
+    before = subject_bbox(original)
+    cleaned = remove_text_bands(original)
+    cleaned = trim_edge_bands(cleaned).convert("RGB")
+    cw,ch = cleaned.size
+
+    # 실제로 거의 안 잘렸으면 그대로 사용
+    if abs(cw-w) < 3 and abs(ch-h) < 3:
+        return cleaned
+
+    # 35% 이상 줄어들면 하나의 정상 상품컷을 억지로 자른 가능성이 높음
+    if (cw*ch) < (w*h*0.65):
+        # 단, 원본 자체가 텍스트/공지 위주면 잘라낸 것을 허용
+        if before is not None and has_visual_product(original):
+            return original
+
+    after = subject_bbox(cleaned)
+    if before is not None and after is not None:
+        # 피사체 면적이 크게 손상되면 원본 유지
+        if bbox_area(after) < bbox_area(before) * 0.62:
+            return original
+        # 세로 피사체가 갑자기 절반 이하로 작아지면 원본 유지
+        if (after[3]-after[1]) < (before[3]-before[1]) * 0.58:
+            return original
+    return cleaned
+
+
+def has_visual_product(pil_img: Image.Image) -> bool:
+    """모델/상품/원단/디테일처럼 시각적 피사체가 있는지 보수적으로 판단."""
+    img = trim_edge_bands(pil_img).convert("RGB")
+    w,h = img.size
+    if w < 120 or h < 120:
+        return False
+    arr=np.array(img).astype(np.int16)
+    lum=arr.mean(axis=2)
+    sat=arr.max(axis=2)-arr.min(axis=2)
+    gray=lum.astype(np.float32)
+    edge=((np.abs(np.diff(gray,axis=1))>16).mean()+(np.abs(np.diff(gray,axis=0))>16).mean())/2
+    white=((arr[:,:,0]>242)&(arr[:,:,1]>242)&(arr[:,:,2]>242)).mean()
+    # 원단 확대컷은 edge/saturation은 낮아도 전체가 흰 배경이 아니고 질감 변화가 있음
+    texture_std=float(gray.std())
+    bbox=subject_bbox(img)
+    if bbox is not None:
+        l,t,r,b=bbox
+        if (r-l)*(b-t) > w*h*0.035:
+            return True
+    return (white < 0.82 and (edge > 0.0045 or texture_std > 9.0 or sat.mean() > 2.8))
+
 def _runs_from_bool(flags, min_len):
     runs, start = [], None
     for i, v in enumerate(flags):
@@ -340,15 +402,19 @@ def _solid_gap_cuts(arr, axis: int, min_gap: int):
     # axis=0 horizontal row cuts, axis=1 vertical col cuts
     a = arr.astype(np.int16)
     white_thr, black_thr = 246, 9
+    lum = a.mean(axis=2)
+    sat = a.max(axis=2) - a.min(axis=2)
     if axis == 0:
         white = (a > white_thr).all(axis=2).mean(axis=1)
         black = (a < black_thr).all(axis=2).mean(axis=1)
+        light_plain = ((lum > 236) & (sat < 18)).mean(axis=1)
         std = a.std(axis=1).mean(axis=1)
     else:
         white = (a > white_thr).all(axis=2).mean(axis=0)
         black = (a < black_thr).all(axis=2).mean(axis=0)
+        light_plain = ((lum > 236) & (sat < 18)).mean(axis=0)
         std = a.std(axis=0).mean(axis=1)
-    flags = ((white > 0.965) | (black > 0.965)) & (std < 13)
+    flags = ((white > 0.93) | (black > 0.965) | (light_plain > 0.94)) & (std < 18)
     return [int((s + e) / 2) for s, e in _runs_from_bool(flags, min_gap)]
 
 
@@ -387,36 +453,97 @@ def _seam_cuts(arr, axis: int, min_piece: int):
     return cuts
 
 
-def split_touching_images(pil_img: Image.Image, target_w: int, target_h: int):
-    """상세 이미지 한 장 안에 여러 사진이 위아래/좌우로 붙은 경우 분리."""
-    img = trim_edge_bands(pil_img)
-    arr = np.array(img.convert("RGB"))
-    h, w = arr.shape[:2]
-    min_h = max(120, int(target_h * 0.28))
-    min_w = max(120, int(target_w * 0.38))
-
-    hcuts = _solid_gap_cuts(arr, axis=0, min_gap=max(8, h // 140)) + _seam_cuts(arr, axis=0, min_piece=min_h)
-    vcuts = _solid_gap_cuts(arr, axis=1, min_gap=max(8, w // 140)) + _seam_cuts(arr, axis=1, min_piece=min_w)
-    hcuts = sorted(set([c for c in hcuts if min_h <= c <= h - min_h]))
-    vcuts = sorted(set([c for c in vcuts if min_w <= c <= w - min_w]))
-
-    # 위아래로 길게 이어붙은 상세컷을 우선 분리합니다.
-    pieces = []
-    if hcuts:
-        bounds = [0] + hcuts + [h]
-        for y1, y2 in zip(bounds[:-1], bounds[1:]):
-            if y2 - y1 >= min_h:
-                pieces.append(img.crop((0, y1, w, y2)))
-    elif vcuts:
-        bounds = [0] + vcuts + [w]
-        for x1, x2 in zip(bounds[:-1], bounds[1:]):
-            if x2 - x1 >= min_w:
-                pieces.append(img.crop((x1, 0, x2, h)))
+def _strong_seam_cuts(arr, axis: int, min_piece: int):
+    """여백 없이 붙은 사진 경계 탐지. 옷 주름/모델 내부선으로 과분할되지 않도록
+    전체 폭/높이의 상당 부분에서 동시에 급변하는 경계만 인정합니다.
+    """
+    a=arr.astype(np.int16)
+    gray=a.mean(axis=2).astype(np.float32)
+    if axis==0:
+        diff=np.abs(np.diff(gray,axis=0))
+        length=a.shape[0]
+        cross=a.shape[1]
     else:
-        pieces = [img]
+        diff=np.abs(np.diff(gray,axis=1))
+        length=a.shape[1]
+        cross=a.shape[0]
+    if length < min_piece*2:
+        return []
+    mean_score=diff.mean(axis=1 if axis==0 else 0)
+    strong_ratio=(diff>28).mean(axis=1 if axis==0 else 0)
+    med=float(np.median(mean_score))
+    p995=float(np.percentile(mean_score,99.5))
+    # 경계선이 화면 대부분을 가로지르는 경우만 인정
+    candidates=np.where((mean_score>=max(11.5, med*4.8, p995*0.92)) & (strong_ratio>0.42))[0]+1
+    cuts=[]
+    for c in candidates:
+        if c < min_piece or length-c < min_piece:
+            continue
+        if cuts and c-cuts[-1] < max(18, min_piece//3):
+            prev=cuts[-1]
+            if mean_score[c-1] > mean_score[prev-1]:
+                cuts[-1]=int(c)
+        else:
+            cuts.append(int(c))
+    return cuts[:3]
 
-    # 과분할/무한 재귀 방지를 위해 1차 경계선 기준으로만 분리합니다.
-    return pieces
+
+def _piece_ok_for_split(piece: Image.Image) -> bool:
+    piece=trim_edge_bands(piece)
+    w,h=piece.size
+    if w<120 or h<120:
+        return False
+    if is_text_or_notice_image(piece):
+        return False
+    return has_visual_product(piece)
+
+
+def split_touching_images(pil_img: Image.Image, target_w: int, target_h: int):
+    """상세 이미지 한 장 안에 여러 사진이 위아래/좌우로 붙은 경우만 분리.
+    v5 핵심: 텍스트/상품 내부선 때문에 정상 1컷을 억지로 반으로 자르지 않습니다.
+    """
+    img = trim_edge_bands(pil_img).convert("RGB")
+    arr = np.array(img)
+    h, w = arr.shape[:2]
+    min_h = max(105, int(target_h * 0.20))
+    min_w = max(105, int(target_w * 0.30))
+
+    # 상세페이지 캡처/원본은 얇은 흰 구분선(2~6px)으로 사진이 이어지는 경우가 많습니다.
+    # 이런 명확한 흰 구분선은 적극 분리하되, 색상 seam 분리는 아래에서 매우 보수적으로 처리합니다.
+    solid_h = _solid_gap_cuts(arr, axis=0, min_gap=2)
+    solid_v = _solid_gap_cuts(arr, axis=1, min_gap=2)
+    seam_h = _strong_seam_cuts(arr, axis=0, min_piece=min_h)
+    seam_v = _strong_seam_cuts(arr, axis=1, min_piece=min_w)
+
+    hcuts = sorted(set([c for c in solid_h + seam_h if min_h <= c <= h - min_h]))
+    vcuts = sorted(set([c for c in solid_v + seam_v if min_w <= c <= w - min_w]))
+
+    def build_h(cuts):
+        bounds=[0]+cuts+[h]
+        return [trim_edge_bands(img.crop((0,y1,w,y2))) for y1,y2 in zip(bounds[:-1],bounds[1:]) if y2-y1>=min_h]
+    def build_v(cuts):
+        bounds=[0]+cuts+[w]
+        return [trim_edge_bands(img.crop((x1,0,x2,h))) for x1,x2 in zip(bounds[:-1],bounds[1:]) if x2-x1>=min_w]
+
+    # 명확한 흰/검정 구분선은 상세페이지 이미지 경계로 보고 우선 분리합니다.
+    # 분리 후 피사체 없는 조각은 뒤 단계에서 자동 제외합니다.
+    if solid_h:
+        pieces = build_h(sorted(set([c for c in solid_h if min_h <= c <= h - min_h])))
+        if len(pieces) >= 2:
+            return pieces
+    if solid_v:
+        pieces = build_v(sorted(set([c for c in solid_v if min_w <= c <= w - min_w])))
+        if len(pieces) >= 2:
+            return pieces
+
+    # 여백 없이 붙은 seam 분리는 과분할 방지를 위해 모든 조각이 상품컷일 때만 인정합니다.
+    for cuts, builder in [(seam_h, build_h), (seam_v, build_v)]:
+        cuts = sorted(set([c for c in cuts if (min_h if builder == build_h else min_w) <= c]))
+        if cuts:
+            pieces=builder(cuts)
+            if len(pieces)>=2 and sum(_piece_ok_for_split(p) for p in pieces) >= 2:
+                return pieces
+    return [img]
 
 
 # =========================
@@ -469,7 +596,7 @@ def crop_to_single_subject(pil_img: Image.Image, target_w: int = DEFAULT_TARGET_
     """텍스트/혜택 영역은 버리고, 1개 피사체를 목표 비율에 맞게 최대한 크게 남깁니다.
     상단/하단 흰 여백이 남지 않도록 bbox 주변을 타이트하게 잡고 목표 비율로 재구성합니다.
     """
-    img = remove_text_bands(trim_edge_bands(pil_img)).convert("RGB")
+    img = trim_edge_bands(pil_img).convert("RGB")
     bbox = subject_bbox(img)
     if bbox is None:
         return trim_edge_bands(img)
@@ -477,7 +604,7 @@ def crop_to_single_subject(pil_img: Image.Image, target_w: int = DEFAULT_TARGET_
     w, h = img.size
     l, t, r, b = bbox
     bw, bh = r - l, b - t
-    # v4: 상/하 흰 여백을 줄이기 위해 기존보다 타이트한 패딩
+    # v5: 상/하 흰 여백을 줄이기 위해 기존보다 타이트한 패딩
     pad_x = max(4, int(bw * 0.035))
     pad_y = max(4, int(bh * 0.025))
     l = clamp(l - pad_x, 0, w - 1)
@@ -568,7 +695,7 @@ def process_image_any(pil_img: Image.Image, prefix: str, target_w: int, target_h
     pieces = split_touching_images(pil_img, target_w, target_h)
 
     for idx, piece in enumerate(pieces, start=1):
-        piece = remove_text_bands(trim_edge_bands(piece))
+        piece = safe_remove_text_bands(trim_edge_bands(piece))
         if skip_no_subject and not has_usable_subject(piece):
             skipped.append((f"{prefix}_{idx:02d}", "피사체 없음/공지·사이즈표·텍스트 카드로 판단"))
             continue
@@ -593,7 +720,7 @@ st.markdown(
     </style>
     <div class="misharp-title-wrap">
       <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
-      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V4</div>
+      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V5</div>
       <div class="misharp-caption">1장=1피사체 / 흰줄·여백 제거 / 피사체 중앙 배치 / 기본 450×633 + 사용자 지정 사이즈</div>
     </div>
     <div class="rule-box">
