@@ -168,19 +168,37 @@ def has_usable_subject(pil_img: Image.Image) -> bool:
 # Trimming
 # =========================
 def trim_edge_bands(pil_img: Image.Image, white_thr: int = 246, black_thr: int = 9):
+    """
+    가장자리 흰/검정 여백 제거.
+    [V5 수정] solid_ratio_thr 0.985 → 0.75 완화:
+      순백(255)이 아닌 연한 배경(~230~246)도 여백으로 인식.
+      url006/007/008 타입의 상단 91% 그레이 여백 제거 가능.
+    """
     img = pil_img.convert("RGB")
     arr = np.array(img).astype(np.int16)
     h, w = arr.shape[:2]
-    solid_ratio_thr = 0.985
-    std_thr = 10.0
+    # 완화된 기준: 행의 75% 이상이 흰색 계열(>230)이고 std가 낮으면 여백 행으로 판단
+    solid_ratio_thr = 0.75
+    std_thr = 18.0
+
     row_white = (arr > white_thr).all(axis=2).mean(axis=1)
+    row_lt    = (arr > 230).all(axis=2).mean(axis=1)   # 연한 배경(>230) 포함
     row_black = (arr < black_thr).all(axis=2).mean(axis=1)
-    row_std = arr.std(axis=1).mean(axis=1)
-    row_band = ((row_white >= solid_ratio_thr) | (row_black >= solid_ratio_thr)) & (row_std <= std_thr)
+    row_std   = arr.std(axis=1).mean(axis=1)
+    row_band  = (
+        ((row_white >= 0.985) | (row_black >= 0.985))   # 기존: 순백/순흑
+        | ((row_lt >= solid_ratio_thr) & (row_std <= std_thr))  # 신규: 연배경 여백
+    )
+
     col_white = (arr > white_thr).all(axis=2).mean(axis=0)
+    col_lt    = (arr > 230).all(axis=2).mean(axis=0)
     col_black = (arr < black_thr).all(axis=2).mean(axis=0)
-    col_std = arr.std(axis=0).mean(axis=1)
-    col_band = ((col_white >= solid_ratio_thr) | (col_black >= solid_ratio_thr)) & (col_std <= std_thr)
+    col_std   = arr.std(axis=0).mean(axis=1)
+    col_band  = (
+        ((col_white >= 0.985) | (col_black >= 0.985))
+        | ((col_lt >= solid_ratio_thr) & (col_std <= std_thr))
+    )
+
     top = 0
     while top < h - 1 and row_band[top]: top += 1
     bottom = h - 1
@@ -189,6 +207,7 @@ def trim_edge_bands(pil_img: Image.Image, white_thr: int = 246, black_thr: int =
     while left < w - 1 and col_band[left]: left += 1
     right = w - 1
     while right > left and col_band[right]: right -= 1
+
     if (right - left + 1) < max(160, w * 0.35) or (bottom - top + 1) < max(160, h * 0.35):
         return img
     return img.crop((left, top, right + 1, bottom + 1))
@@ -285,8 +304,10 @@ def split_touching_images(pil_img: Image.Image, target_w: int, target_h: int):
 def subject_center(pil_img: Image.Image):
     """
     피사체 중심 계산.
-    전신샷처럼 피사체가 세로를 꽉 채울 때 단순 bbox 중심 대신
-    상단을 조금 더 보여주는 방향으로 보정 (머리가 잘리는 현상 방지).
+    [V5 수정] 보정 기준 강화:
+      - 피사체가 세로 60% 이상 → 상단 보정 적용 (기존 75%)
+      - 보정 지점 bbox 35% (기존 40%) → 머리가 더 잘 보임
+      - 피사체가 이미지 하단에 치우쳐 있을 때 (center > 0.60) 추가 보정
     """
     bbox = subject_bbox(pil_img)
     w, h = pil_img.size
@@ -295,9 +316,14 @@ def subject_center(pil_img: Image.Image):
     l, t, r, b = bbox
     cx = (l + r) / 2.0
     bh = b - t
-    # 피사체가 세로의 75% 이상이면 전신샷으로 간주
-    # → 중심을 bbox 중앙이 아닌 위쪽 40% 지점으로 올려서 머리가 잘리지 않게 함
-    if bh / float(h) >= 0.75:
+    bh_ratio = bh / float(h)
+    bbox_center = (t + b) / 2.0 / h  # 피사체 중심의 이미지 내 위치 (0~1)
+
+    if bh_ratio >= 0.60:
+        # 전신샷: 상단 35% 지점을 중심으로 → 머리/얼굴 우선
+        cy = t + bh * 0.35
+    elif bbox_center > 0.60:
+        # 피사체가 하단 치우침: 보정 없이 두면 하단 잘림 → 위로 당김
         cy = t + bh * 0.40
     else:
         cy = (t + b) / 2.0
@@ -306,20 +332,19 @@ def subject_center(pil_img: Image.Image):
 def resize_cover_then_crop(pil_img: Image.Image, target_w: int, target_h: int, center_xy=None):
     """
     Cover 방식 리사이즈 후 center_xy 기준으로 크롭.
-    피사체가 세로를 꽉 채운 전신샷은 가로만 맞추고 세로는 자르지 않는 fit 방식으로 전환.
+    [V5 수정] 세로 fit 전환 기준 완화: src_ratio > tgt_ratio * 1.05
+      기존 1.15 기준에서 누락되던 케이스(약간만 세로로 긴 전신샷)도 포함.
     """
     img = pil_img.convert("RGB")
     W, H = img.size
 
-    # 전신샷 판별: 이미지 비율이 target 비율보다 훨씬 세로가 길면 fit(세로 기준) 사용
     src_ratio = H / max(W, 1)
     tgt_ratio = target_h / max(target_w, 1)
 
-    if src_ratio > tgt_ratio * 1.15:
-        # 세로 fit: 가로를 target에 맞추고 세로는 비율대로 (크롭 최소화)
+    if src_ratio > tgt_ratio * 1.05:
+        # 세로 fit: 가로를 target에 맞추고 세로 크롭 최소화
         scale = target_w / W
     else:
-        # 일반 cover: 짧은 쪽을 target에 맞춤
         scale = max(target_w / W, target_h / H)
 
     new_w, new_h = int(round(W * scale)), int(round(H * scale))
@@ -336,9 +361,7 @@ def resize_cover_then_crop(pil_img: Image.Image, target_w: int, target_h: int, c
     left = clamp(left, 0, max(0, new_w - target_w))
     top  = clamp(top,  0, max(0, new_h - target_h))
 
-    # new_h가 target_h보다 작으면 세로 중앙 배치 (여백 없이 붙임)
     if new_h < target_h:
-        # 상하 여백 없이 가로만 맞춘 결과물 → 그대로 반환 (세로 패딩 없음)
         return resized.crop((left, 0, left + target_w, new_h)).resize(
             (target_w, target_h), Image.LANCZOS
         )
@@ -470,7 +493,7 @@ st.markdown("""
 </style>
 <div class="misharp-title-wrap">
   <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
-  <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V4 — 전신샷 크롭 개선 / 진행바 / 병렬처리</div>
+  <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V5 — 여백제거 강화 / 전신샷 보정 / 진행바 / 병렬처리</div>
   <div class="misharp-caption">1장=1피사체 / 흰줄·여백 제거 / 피사체 중앙 배치 / 기본 450×633</div>
 </div>
 <div class="rule-box">
