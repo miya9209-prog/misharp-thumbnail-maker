@@ -1,6 +1,7 @@
 import io
 import re
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 
 import numpy as np
@@ -555,7 +556,14 @@ def subject_center(pil_img: Image.Image):
     if bbox is None:
         return (w / 2.0, h / 2.0)
     l, t, r, b = bbox
-    return ((l + r) / 2.0, (t + b) / 2.0)
+    cx = (l + r) / 2.0
+    bh = b - t
+    # 피사체가 세로의 65% 이상이면 전신샷 → 상단(얼굴) 우선 보정
+    if bh / float(h) >= 0.65:
+        cy = t + bh * 0.38
+    else:
+        cy = (t + b) / 2.0
+    return (cx, cy)
 
 
 def resize_cover_then_crop(pil_img: Image.Image, target_w: int, target_h: int, center_xy=None):
@@ -593,8 +601,8 @@ def edge_bleed_fix(pil_img: Image.Image, n: int = 3):
 
 
 def crop_to_single_subject(pil_img: Image.Image, target_w: int = DEFAULT_TARGET_W, target_h: int = DEFAULT_TARGET_H):
-    """텍스트/혜택 영역은 버리고, 1개 피사체를 목표 비율에 맞게 최대한 크게 남깁니다.
-    상단/하단 흰 여백이 남지 않도록 bbox 주변을 타이트하게 잡고 목표 비율로 재구성합니다.
+    """텍스트/여백을 제거하고 피사체 주변만 남깁니다.
+    비율은 강제하지 않습니다 — resize_cover_then_crop이 비율을 맞춥니다.
     """
     img = trim_edge_bands(pil_img).convert("RGB")
     bbox = subject_bbox(img)
@@ -604,49 +612,79 @@ def crop_to_single_subject(pil_img: Image.Image, target_w: int = DEFAULT_TARGET_
     w, h = img.size
     l, t, r, b = bbox
     bw, bh = r - l, b - t
-    # v5: 상/하 흰 여백을 줄이기 위해 기존보다 타이트한 패딩
-    pad_x = max(4, int(bw * 0.035))
-    pad_y = max(4, int(bh * 0.025))
+
+    # 피사체 주변 소폭 패딩 (비율 변경 없이)
+    pad_x = max(6, int(bw * 0.05))
+    pad_y = max(6, int(bh * 0.04))
     l = clamp(l - pad_x, 0, w - 1)
     r = clamp(r + pad_x, 1, w)
     t = clamp(t - pad_y, 0, h - 1)
     b = clamp(b + pad_y, 1, h)
 
-    bw, bh = r - l, b - t
-    target_aspect = float(target_w) / float(target_h)
-    box_aspect = bw / max(bh, 1)
-    cx = (l + r) / 2.0
-    cy = (t + b) / 2.0
-
-    # 목표 비율을 만족하는 최소 crop box를 만든 뒤, 피사체가 중앙에 오도록 이동
-    if box_aspect > target_aspect:
-        crop_w = bw
-        crop_h = crop_w / target_aspect
-    else:
-        crop_h = bh
-        crop_w = crop_h * target_aspect
-
-    # 너무 꽉 끼면 상품 디테일이 잘릴 수 있어 2~4%만 보정
-    crop_w *= 1.025
-    crop_h *= 1.025
-    crop_w = min(crop_w, w)
-    crop_h = min(crop_h, h)
-
-    left = int(round(cx - crop_w / 2.0))
-    top = int(round(cy - crop_h / 2.0))
-    left = clamp(left, 0, max(0, w - int(round(crop_w))))
-    top = clamp(top, 0, max(0, h - int(round(crop_h))))
-    right = clamp(left + int(round(crop_w)), 1, w)
-    bottom = clamp(top + int(round(crop_h)), 1, h)
-
-    cropped = img.crop((left, top, right, bottom))
+    cropped = img.crop((l, t, r, b))
     return trim_edge_bands(cropped)
 
 
 def make_thumbnail(pil_img: Image.Image, target_w: int, target_h: int):
-    cut = crop_to_single_subject(pil_img, target_w, target_h)
-    cxy = subject_center(cut)
-    out = resize_cover_then_crop(cut, target_w, target_h, center_xy=cxy)
+    """
+    항상 cover 방식. 여백/패딩 절대 없음.
+    - 이미지를 target 크기로 확대해서 꽉 채움
+    - 피사체(모델/상품) 중심 기준으로 크롭 위치 결정
+    - 전신샷은 얼굴이 잘리지 않도록 상단 우선
+    """
+    img = trim_edge_bands(pil_img).convert("RGB")
+    W, H = img.size
+
+    # cover: 짧은 쪽이 target에 꽉 차도록 확대
+    scale = max(target_w / W, target_h / H)
+    new_w = int(round(W * scale))
+    new_h = int(round(H * scale))
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+
+    # 피사체 중심 파악 (행 평균 밝기 기반)
+    arr = np.array(img).astype(np.float32)
+    gray = arr.mean(axis=2)
+    row_m = gray.mean(axis=1)
+    col_m = gray.mean(axis=0)
+
+    # 배경보다 어두운 행/열 = 피사체
+    bg_lum = float(np.percentile(row_m, 85))
+    thr = bg_lum * 0.95
+    subj_rows = np.where(row_m < thr)[0]
+    subj_cols = np.where(col_m < thr)[0]
+
+    if len(subj_rows) > 0:
+        s_top = float(subj_rows[0]) / H
+        s_bot = float(subj_rows[-1]) / H
+    else:
+        s_top, s_bot = 0.0, 1.0
+
+    if len(subj_cols) > 0:
+        s_left = float(subj_cols[0]) / W
+        s_right = float(subj_cols[-1]) / W
+    else:
+        s_left, s_right = 0.0, 1.0
+
+    subj_h = s_bot - s_top
+
+    # 세로 크롭 위치: 전신샷(피사체가 세로 65% 이상)이면 상단 우선
+    if subj_h >= 0.65:
+        cy_ratio = s_top + subj_h * 0.38   # 얼굴이 상단 38% 지점에 오도록
+    else:
+        cy_ratio = (s_top + s_bot) / 2.0
+
+    # 가로 크롭 위치: 피사체 수평 중심
+    cx_ratio = (s_left + s_right) / 2.0
+
+    cx_s = W * cx_ratio * scale
+    cy_s = H * cy_ratio * scale
+
+    left = int(round(cx_s - target_w / 2.0))
+    top  = int(round(cy_s - target_h / 2.0))
+    left = clamp(left, 0, max(0, new_w - target_w))
+    top  = clamp(top,  0, max(0, new_h - target_h))
+
+    out = resized.crop((left, top, left + target_w, top + target_h))
     return edge_bleed_fix(out, n=3)
 
 
@@ -704,27 +742,76 @@ def process_image_any(pil_img: Image.Image, prefix: str, target_w: int, target_h
     return outputs, skipped
 
 
+def _dl_and_process(args):
+    i, url, target_w, target_h, skip_no_subject = args
+    try:
+        pil = download_image(url)
+        outs, skips = process_image_any(pil, f"url{i:03d}", target_w, target_h, skip_no_subject)
+        return i, outs, skips
+    except Exception as e:
+        return i, [], [(f"url{i:03d}", f"다운로드/처리 실패: {e}")]
+
+
+def run_parallel(urls, target_w, target_h, skip_no_subject, max_workers=5, progress_slot=None):
+    """병렬 다운로드+처리. progress_slot=st.empty() 전달 시 진행바 표시."""
+    total = len(urls)
+    all_outputs, all_skipped = [], []
+    args = [(i, u, target_w, target_h, skip_no_subject) for i, u in enumerate(urls, 1)]
+    done = 0
+    if progress_slot:
+        progress_slot.progress(0.0, text=f"⏳ 처리 중... 0 / {total} (0%)")
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_dl_and_process, a): a for a in args}
+        for fut in as_completed(futures):
+            _, outs, skips = fut.result()
+            all_outputs += outs
+            all_skipped += skips
+            done += 1
+            if progress_slot:
+                pct = done / total
+                progress_slot.progress(pct, text=f"⏳ 처리 중... {done} / {total} ({int(pct*100)}%)")
+    if progress_slot:
+        progress_slot.progress(1.0, text=f"✅ 완료! {total}개 처리됨")
+    return all_outputs, all_skipped
+
+
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(layout="wide")
-
-st.markdown(
-    """
-    <style>
-      .misharp-title-wrap { margin-top: 8px; margin-bottom: 6px; }
-      .misharp-title { font-size: 1.55rem; font-weight: 800; letter-spacing: -0.02em; margin: 0; }
-      .misharp-sub { font-size: 0.78rem; color: #666; margin-top: 6px; }
-      .misharp-caption { color:#666; font-size: 0.92rem; margin-top: 8px; }
-      .rule-box {background:#fff7f7; border:1px solid #f1c4c4; border-radius:12px; padding:12px 14px; color:#5b1b1b; font-size:0.93rem; line-height:1.55;}
-    </style>
-    <div class="misharp-title-wrap">
-      <div class="misharp-title">MISHARP 상세페이지 썸네일 생성기</div>
-      <div class="misharp-sub">MISHARP THUMBNAIL GENERATOR V5</div>
-          </div>
-    """,
-    unsafe_allow_html=True,
+st.set_page_config(
+    page_title="미샵 썸네일 생성기 | MISHARP Thumbnail Generator",
+    page_icon="🖼️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
+
+st.markdown("""
+<head>
+  <meta charset="UTF-8">
+  <meta name="description" content="미샵 상세페이지 이미지에서 쇼핑몰 등록용 썸네일을 자동 생성. 피사체 자동 감지, 여백 제거, 450×633 리사이즈, ZIP 일괄 다운로드.">
+  <meta name="keywords" content="미샵,썸네일 생성기,쇼핑몰 썸네일,상품 이미지,Cafe24,이미지 리사이즈,MISHARP,misharpcompany">
+  <meta name="author" content="misharpcompany">
+  <meta name="robots" content="noindex, nofollow">
+  <meta property="og:title" content="미샵 썸네일 생성기 | MISHARP Thumbnail Generator">
+  <meta property="og:description" content="상세페이지 URL 한 번으로 쇼핑몰 썸네일 자동 생성. 피사체 중앙 배치, 흰여백 제거, 450×633 일괄 출력.">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="MISHARP Tools">
+  <script type="application/ld+json">
+  {"@context":"https://schema.org","@type":"WebApplication","name":"미샵 썸네일 생성기",
+   "alternateName":"MISHARP Thumbnail Generator",
+   "description":"쇼핑몰 상세페이지 이미지에서 썸네일을 자동 추출·생성하는 내부 도구",
+   "applicationCategory":"UtilitiesApplication",
+   "author":{"@type":"Organization","name":"misharpcompany","url":"https://misharp.co.kr"},
+   "offers":{"@type":"Offer","price":"0"}}
+  </script>
+</head>
+<style>
+  .misharp-title{font-size:1.55rem;font-weight:800;letter-spacing:-0.02em;margin:8px 0 2px;}
+  .misharp-sub{font-size:0.78rem;color:#888;margin-bottom:8px;}
+</style>
+<div class="misharp-title">MISHARP 썸네일 생성기</div>
+<div class="misharp-sub">MISHARP Thumbnail Generator · misharpcompany</div>
+""", unsafe_allow_html=True)
 
 with st.expander("생성 옵션", expanded=True):
     c1, c2, c3 = st.columns([1, 1, 2])
@@ -734,17 +821,18 @@ with st.expander("생성 옵션", expanded=True):
         target_h = st.number_input("세로(px)", min_value=200, max_value=3000, value=DEFAULT_TARGET_H, step=10)
     with c3:
         preset = st.selectbox("빠른 사이즈", ["기본 450×633", "정사각 1000×1000", "세로 800×1200", "가로 1200×800", "직접 입력"], index=0)
-        if preset == "기본 450×633":
-            target_w, target_h = 450, 633
-        elif preset == "정사각 1000×1000":
-            target_w, target_h = 1000, 1000
-        elif preset == "세로 800×1200":
-            target_w, target_h = 800, 1200
-        elif preset == "가로 1200×800":
-            target_w, target_h = 1200, 800
-    max_images = st.slider("상세영역에서 수집할 최대 이미지 수", 50, 600, 250, step=50)
-    skip_no_subject = st.checkbox("피사체 없는 이미지 자동 제외", value=True)
-   
+        if preset == "기본 450×633":      target_w, target_h = 450, 633
+        elif preset == "정사각 1000×1000": target_w, target_h = 1000, 1000
+        elif preset == "세로 800×1200":   target_w, target_h = 800, 1200
+        elif preset == "가로 1200×800":   target_w, target_h = 1200, 800
+    ca, cb = st.columns(2)
+    with ca:
+        max_images = st.slider("상세영역에서 수집할 최대 이미지 수", 50, 600, 250, step=50)
+        skip_no_subject = st.checkbox("피사체 없는 이미지 자동 제외", value=True)
+    with cb:
+        max_workers = st.slider("동시 처리 수 (높을수록 빠름)", 1, 8, 5, step=1,
+                                help="병렬 다운로드+처리 수. 서버 부하를 고려해 5 권장.")
+
 all_outputs = []
 skipped_all = []
 
@@ -761,15 +849,11 @@ with tab1:
             if not urls:
                 st.error("본문(상세영역)에서 이미지 URL을 찾지 못했습니다. 테마 구조가 다를 수 있어요.")
             else:
-                with st.spinner(f"다운로드 및 처리 중… ({len(urls)}개)"):
-                    for i, u in enumerate(urls, start=1):
-                        try:
-                            pil = download_image(u)
-                            outs, skips = process_image_any(pil, f"url{i:03d}", int(target_w), int(target_h), skip_no_subject)
-                            all_outputs += outs
-                            skipped_all += skips
-                        except Exception as e:
-                            skipped_all.append((f"url{i:03d}", f"다운로드/처리 실패: {e}"))
+                st.info(f"📦 이미지 {len(urls)}개 수집됨. 썸네일 생성 시작...")
+                prog = st.empty()
+                all_outputs, skipped_all = run_parallel(
+                    urls, int(target_w), int(target_h), skip_no_subject,
+                    max_workers=max_workers, progress_slot=prog)
 
 with tab2:
     st.write("이미지 URL을 여러 줄로 붙여넣으세요. 각 줄 1개")
@@ -779,29 +863,29 @@ with tab2:
         if not lines:
             st.error("이미지 URL을 넣어주세요.")
         else:
-            with st.spinner(f"다운로드 및 처리 중… ({len(lines)}개)"):
-                for i, u in enumerate(lines, start=1):
-                    try:
-                        pil = download_image(u)
-                        outs, skips = process_image_any(pil, f"img{i:03d}", int(target_w), int(target_h), skip_no_subject)
-                        all_outputs += outs
-                        skipped_all += skips
-                    except Exception as e:
-                        skipped_all.append((f"img{i:03d}", f"다운로드/처리 실패: {e}"))
+            st.info(f"📦 이미지 {len(lines)}개 처리 시작...")
+            prog2 = st.empty()
+            all_outputs, skipped_all = run_parallel(
+                lines, int(target_w), int(target_h), skip_no_subject,
+                max_workers=max_workers, progress_slot=prog2)
 
 with tab3:
     uploads = st.file_uploader("상세페이지 이미지 업로드 (여러 장 가능)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True)
     if uploads:
-        with st.spinner(f"업로드 이미지 처리 중… ({len(uploads)}개)"):
-            for i, f in enumerate(uploads, start=1):
-                try:
-                    pil = Image.open(f).convert("RGB")
-                    base = safe_name(f.name.rsplit(".", 1)[0])
-                    outs, skips = process_image_any(pil, f"up{i:03d}_{base}", int(target_w), int(target_h), skip_no_subject)
-                    all_outputs += outs
-                    skipped_all += skips
-                except Exception as e:
-                    skipped_all.append((f"up{i:03d}_{f.name}", f"업로드 처리 실패: {e}"))
+        prog3 = st.empty()
+        prog3.progress(0.0, text=f"⏳ 처리 중... 0 / {len(uploads)} (0%)")
+        for i, f in enumerate(uploads, start=1):
+            try:
+                pil = Image.open(f).convert("RGB")
+                base = safe_name(f.name.rsplit(".", 1)[0])
+                outs, skips = process_image_any(pil, f"up{i:03d}_{base}", int(target_w), int(target_h), skip_no_subject)
+                all_outputs += outs
+                skipped_all += skips
+            except Exception as e:
+                skipped_all.append((f"up{i:03d}_{f.name}", f"업로드 처리 실패: {e}"))
+            pct = i / len(uploads)
+            prog3.progress(pct, text=f"⏳ 처리 중... {i} / {len(uploads)} ({int(pct*100)}%)")
+        prog3.progress(1.0, text=f"✅ 완료! {len(uploads)}개 처리됨")
 
 if all_outputs:
     st.success(f"총 {len(all_outputs)}장 생성 완료 ({int(target_w)}×{int(target_h)})")
@@ -818,7 +902,6 @@ if all_outputs:
             report = "\n".join([f"{name}\t{reason}" for name, reason in skipped_all])
             zf.writestr("_skipped_images_report.txt", report)
     zip_buf.seek(0)
-
     st.download_button(
         f"ZIP 다운로드 ({int(target_w)}×{int(target_h)})",
         data=zip_buf,
@@ -833,17 +916,9 @@ if skipped_all:
         for name, reason in skipped_all[:200]:
             st.write(f"- {name}: {reason}")
 
-st.markdown(
-    """
-    <hr style="margin-top:40px; margin-bottom:10px;">
-    <div style="font-size:11px; color:#888; line-height:1.5; text-align:center;">
-        ⓒ misharpcompany. All rights reserved.<br>
-        본 프로그램의 저작권은 미샵컴퍼니(misharpcompany)에 있으며, 무단 복제·배포·사용을 금합니다.<br>
-        본 프로그램은 미샵컴퍼니 내부 직원 전용으로, 외부 유출 및 제3자 제공을 엄격히 금합니다.
-        <br><br>
-        This program is the intellectual property of misharpcompany.
-        Unauthorized copying, distribution, or use is strictly prohibited.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("""
+<hr style="margin-top:40px;margin-bottom:10px;">
+<div style="font-size:11px;color:#aaa;line-height:1.5;text-align:center;">
+    ⓒ misharpcompany. All rights reserved. 본 프로그램은 미샵컴퍼니 내부 전용입니다.
+</div>
+""", unsafe_allow_html=True)
